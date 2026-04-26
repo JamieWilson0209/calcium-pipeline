@@ -342,9 +342,30 @@
 
     <div class="pipeline">
 
-        <!-- ─── Stage 1: Projections ─── -->
+
+
+        <!-- ─── Stage 1: Motion Correction ─── -->
         <div class="stage fade-in">
             <p class="stage-number">Stage 01</p>
+            <h2>Motion Correction</h2>
+            <p class="stage-desc">
+                Sample drift during recording is corrected via rigid registration — each frame
+                is aligned to a reference template using phase-correlation, producing sub-pixel
+                displacement estimates. This is applied before trace extraction to prevent
+                spatial contamination between neighbouring ROIs.
+            </p>
+            <div class="stage-figure">
+                <img src="figures/fig5_motion_correction.png" alt="Motion correction shifts">
+                <p class="stage-caption">
+                    <strong>Left:</strong> Frame-by-frame Y and X displacement over time.
+                    <strong>Right:</strong> Distribution of total shift magnitudes across all frames.
+                </p>
+            </div>
+        </div>
+        
+        <!-- ─── Stage 2: Projections ─── -->
+        <div class="stage fade-in">
+            <p class="stage-number">Stage 02</p>
             <h2>Summary Projections</h2>
             <p class="stage-desc">
                 A 5-minute recording at 2 Hz produces 600 frames of noisy fluorescence data.
@@ -364,9 +385,9 @@
             </div>
         </div>
 
-        <!-- ─── Stage 2: Detection ─── -->
+        <!-- ─── Stage 3: Detection ─── -->
         <div class="stage fade-in">
-            <p class="stage-number">Stage 02</p>
+            <p class="stage-number">Stage 03</p>
             <h2>Cell Detection</h2>
             <p class="stage-desc">
                 Cells are detected in two steps: multi-scale Laplacian-of-Gaussian (LoG) blob
@@ -393,9 +414,9 @@
             </div>
         </div>
 
-        <!-- ─── Stage 3: Traces ─── -->
+        <!-- ─── Stage 4: Traces ─── -->
         <div class="stage fade-in">
-            <p class="stage-number">Stage 03</p>
+            <p class="stage-number">Stage 04</p>
             <h2>Calcium Trace Extraction</h2>
             <p class="stage-desc">
                 For each detected cell, the mean fluorescence intensity within its contour is
@@ -424,9 +445,9 @@
             </div>
         </div>
 
-        <!-- ─── Stage 4: Deconvolution ─── -->
+        <!-- ─── Stage 5: Deconvolution ─── -->
         <div class="stage fade-in">
-            <p class="stage-number">Stage 04</p>
+            <p class="stage-number">Stage 05</p>
             <h2>Spike Inference</h2>
             <p class="stage-desc">
                 The slow calcium indicator dynamics (Fluo-4 τ ≈ 400 ms) blur the timing of
@@ -454,24 +475,6 @@
             </div>
         </div>
 
-        <!-- ─── Stage 5: Motion Correction ─── -->
-        <div class="stage fade-in">
-            <p class="stage-number">Stage 05</p>
-            <h2>Motion Correction</h2>
-            <p class="stage-desc">
-                Sample drift during recording is corrected via rigid registration — each frame
-                is aligned to a reference template using phase-correlation, producing sub-pixel
-                displacement estimates. This is applied before trace extraction to prevent
-                spatial contamination between neighbouring ROIs.
-            </p>
-            <div class="stage-figure">
-                <img src="figures/fig5_motion_correction.png" alt="Motion correction shifts">
-                <p class="stage-caption">
-                    <strong>Left:</strong> Frame-by-frame Y and X displacement over time.
-                    <strong>Right:</strong> Distribution of total shift magnitudes across all frames.
-                </p>
-            </div>
-        </div>
 
     </div>
 
