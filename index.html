@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calcium Imaging Pipeline — Jamie Wilson</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&family=Source+Sans+3:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-deep:    #080C12;
+            --bg-dark:    #0D1117;
+            --bg-panel:   #161B22;
+            --bg-card:    #1C2128;
+            --teal:       #0DC5C1;
+            --teal-dim:   #0A8F96;
+            --teal-glow:  rgba(13, 197, 193, 0.12);
+            --cyan:       #22D3EE;
+            --amber:      #F59E0B;
+            --red-soft:   #EF6461;
+            --white:      #E6EDF3;
+            --grey-text:  #8B949E;
+            --grey-dim:   #30363D;
+            --grey-line:  #484F58;
+            --serif:      'Cormorant Garamond', Georgia, serif;
+            --sans:       'Source Sans 3', system-ui, sans-serif;
+            --mono:       'JetBrains Mono', 'Consolas', monospace;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; background: var(--bg-deep); }
+
+        body {
+            font-family: var(--sans);
+            color: var(--grey-text);
+            background: var(--bg-deep);
+            line-height: 1.7;
+            font-weight: 300;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(13, 197, 193, 0.015) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(13, 197, 193, 0.015) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* ─── Nav ─── */
+        nav {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background: rgba(8, 12, 18, 0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--grey-dim);
+            padding: 0.9rem 2rem;
+        }
+
+        nav .nav-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        nav a.nav-name {
+            font-family: var(--serif);
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--white);
+            text-decoration: none;
+        }
+
+        nav .nav-links {
+            display: flex;
+            gap: 2rem;
+        }
+
+        nav .nav-links a {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            letter-spacing: 0.08em;
+            color: var(--grey-text);
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        nav .nav-links a:hover { color: var(--teal); }
+
+        /* ─── Page Header ─── */
+        .page-header {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 5rem 2rem 3rem;
+        }
+
+        .page-header .breadcrumb {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--grey-dim);
+            margin-bottom: 1.5rem;
+        }
+
+        .page-header .breadcrumb a {
+            color: var(--teal-dim);
+            text-decoration: none;
+        }
+
+        .page-header .breadcrumb a:hover { color: var(--teal); }
+
+        .page-header h1 {
+            font-family: var(--serif);
+            font-size: clamp(2rem, 5vw, 3.2rem);
+            font-weight: 700;
+            color: var(--white);
+            line-height: 1.2;
+            margin-bottom: 1rem;
+        }
+
+        .page-header h1 .accent { color: var(--teal); }
+
+        .page-header .lead {
+            font-size: 1.1rem;
+            color: var(--grey-text);
+            max-width: 680px;
+            line-height: 1.8;
+        }
+
+        /* ─── Pipeline stages ─── */
+        .pipeline {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 0 2rem 4rem;
+            position: relative;
+        }
+
+        /* Vertical connector line */
+        .pipeline::before {
+            content: '';
+            position: absolute;
+            left: calc(2rem + 11px);
+            top: 0;
+            bottom: 4rem;
+            width: 1px;
+            background: linear-gradient(
+                to bottom,
+                var(--teal-dim) 0%,
+                var(--grey-dim) 30%,
+                var(--grey-dim) 70%,
+                var(--teal-dim) 100%
+            );
+        }
+
+        .stage {
+            position: relative;
+            padding-left: 3.5rem;
+            margin-bottom: 5rem;
+        }
+
+        /* Stage node dot */
+        .stage::before {
+            content: '';
+            position: absolute;
+            left: 5px;
+            top: 0.35rem;
+            width: 13px;
+            height: 13px;
+            border-radius: 50%;
+            background: var(--bg-deep);
+            border: 2px solid var(--teal-dim);
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+
+        .stage:hover::before {
+            border-color: var(--teal);
+            box-shadow: 0 0 12px var(--teal-glow);
+        }
+
+        .stage-number {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--teal-dim);
+            margin-bottom: 0.4rem;
+        }
+
+        .stage h2 {
+            font-family: var(--serif);
+            font-size: 1.8rem;
+            font-weight: 600;
+            color: var(--white);
+            margin-bottom: 0.8rem;
+        }
+
+        .stage-desc {
+            font-size: 0.95rem;
+            color: var(--grey-text);
+            max-width: 640px;
+            margin-bottom: 1.5rem;
+            line-height: 1.8;
+        }
+
+        .stage-figure {
+            background: var(--bg-panel);
+            border: 1px solid var(--grey-dim);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+            transition: border-color 0.3s;
+        }
+
+        .stage-figure:hover {
+            border-color: var(--grey-line);
+        }
+
+        .stage-figure img {
+            width: 100%;
+            display: block;
+        }
+
+        .stage-caption {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--grey-dim);
+            padding: 0.8rem 1.2rem;
+            border-top: 1px solid var(--grey-dim);
+            line-height: 1.6;
+        }
+
+        .stage-caption strong {
+            color: var(--grey-text);
+        }
+
+        /* ─── Method detail boxes ─── */
+        .method-box {
+            background: var(--bg-card);
+            border-left: 2px solid var(--teal-dim);
+            padding: 1.2rem 1.5rem;
+            margin: 1.2rem 0;
+            border-radius: 0 4px 4px 0;
+        }
+
+        .method-box h4 {
+            font-family: var(--mono);
+            font-size: 0.78rem;
+            color: var(--teal);
+            margin-bottom: 0.4rem;
+            letter-spacing: 0.05em;
+        }
+
+        .method-box p {
+            font-size: 0.88rem;
+            color: var(--grey-text);
+            line-height: 1.7;
+        }
+
+        .method-box code {
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            color: var(--amber);
+            background: var(--bg-panel);
+            padding: 0.1rem 0.4rem;
+            border-radius: 2px;
+        }
+
+        /* ─── Footer ─── */
+        footer {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 3rem 2rem 4rem;
+            border-top: 1px solid var(--grey-dim);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        footer p {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--grey-dim);
+        }
+
+        footer a {
+            font-family: var(--mono);
+            font-size: 0.72rem;
+            color: var(--grey-text);
+            text-decoration: none;
+        }
+
+        footer a:hover { color: var(--teal); }
+
+        /* ─── Animations ─── */
+        .fade-in {
+            opacity: 0;
+            transform: translateY(20px);
+            transition: opacity 0.6s ease, transform 0.6s ease;
+        }
+
+        .fade-in.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        @media (max-width: 768px) {
+            .pipeline::before { left: calc(2rem + 8px); }
+            .stage { padding-left: 2.5rem; }
+            .stage::before { left: 2px; width: 11px; height: 11px; }
+        }
+    </style>
+</head>
+<body>
+
+    <nav>
+        <div class="nav-inner">
+            <a href="https://jamiewilson0209.github.io/" class="nav-name">JW</a>
+            <div class="nav-links">
+                <a href="https://jamiewilson0209.github.io/">Home</a>
+                <a href="https://jamiewilson0209.github.io/#projects">Projects</a>
+                <a href="https://github.com/JamieWilson0209/calcium-pipeline" target="_blank">Source Code</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="page-header">
+        <p class="breadcrumb"><a href="https://jamiewilson0209.github.io/">Home</a> / Calcium Pipeline</p>
+        <h1>Calcium Imaging <span class="accent">Analysis Pipeline</span></h1>
+        <p class="lead">
+            A computational pipeline that processes raw widefield fluorescence recordings
+            of brain organoids into quantified neural activity. Each stage below shows
+            real data from a Fluo-4 AM recording of iPSC-derived organoids. The pipeline
+            is currently functional and under active development.
+        </p>
+    </div>
+
+    <div class="pipeline">
+
+        <!-- ─── Stage 1: Projections ─── -->
+        <div class="stage fade-in">
+            <p class="stage-number">Stage 01</p>
+            <h2>Summary Projections</h2>
+            <p class="stage-desc">
+                A 5-minute recording at 2 Hz produces 600 frames of noisy fluorescence data.
+                Before detecting individual cells, we compress the temporal dimension into
+                spatial summary images that highlight different aspects of the data — maximum
+                brightness, temporal variability, and local correlations between neighbouring pixels.
+            </p>
+            <div class="stage-figure">
+                <img src="figures/fig1_projections.png" alt="Max, correlation, and std projections">
+                <p class="stage-caption">
+                    <strong>Max projection</strong> reveals the brightest each pixel ever gets —
+                    highlighting active cells. <strong>Local correlation</strong> shows where
+                    neighbouring pixels co-fluctuate, distinguishing cells from noise.
+                    <strong>Std projection</strong> maps temporal variability — active cells
+                    flicker more than background.
+                </p>
+            </div>
+        </div>
+
+        <!-- ─── Stage 2: Detection ─── -->
+        <div class="stage fade-in">
+            <p class="stage-number">Stage 02</p>
+            <h2>Cell Detection</h2>
+            <p class="stage-desc">
+                Cells are detected in two steps: multi-scale Laplacian-of-Gaussian (LoG) blob
+                detection identifies candidate cell locations and radii, then per-seed Otsu
+                thresholding with a Gaussian locality mask extracts precise contour boundaries.
+            </p>
+            <div class="stage-figure">
+                <img src="figures/fig2_detection.png" alt="ROI contour overlays and detail panels">
+                <p class="stage-caption">
+                    <strong>Left:</strong> All detected ROI contours overlaid on the max projection.
+                    <strong>Right:</strong> Zoomed detail panels showing individual cell contours
+                    with centroid markers.
+                </p>
+            </div>
+            <div class="method-box">
+                <h4>Method Detail</h4>
+                <p>
+                    LoG blob detection operates across multiple spatial scales to find cell-body-sized
+                    features regardless of exact cell radius. Contour extraction uses the std projection
+                    within a Gaussian-weighted locality mask around each seed, applying Otsu's threshold
+                    to separate cell from background. Overlapping contours are resolved via
+                    signed-distance partitioning.
+                </p>
+            </div>
+        </div>
+
+        <!-- ─── Stage 3: Traces ─── -->
+        <div class="stage fade-in">
+            <p class="stage-number">Stage 03</p>
+            <h2>Calcium Trace Extraction</h2>
+            <p class="stage-desc">
+                For each detected cell, the mean fluorescence intensity within its contour is
+                extracted across all frames, producing a raw fluorescence time series. This is
+                converted to ΔF/F₀ by estimating and dividing out a rolling baseline, yielding
+                a trace where transient peaks correspond to calcium influx events — a proxy for
+                neural activity.
+            </p>
+            <div class="stage-figure">
+                <img src="figures/fig3_annotated_trace.png" alt="Annotated calcium trace">
+                <p class="stage-caption">
+                    A single neuron's ΔF/F₀ trace with baseline (dashed), 2σ noise band (grey),
+                    5σ detection threshold (amber), and detected transient events (red markers).
+                    The lower panel shows the corresponding spike raster with event amplitudes.
+                </p>
+            </div>
+            <div class="method-box">
+                <h4>Method Detail</h4>
+                <p>
+                    Baseline estimated as the 20th percentile of the trace. Noise estimated via
+                    the MAD of temporal differences:
+                    <code>σ = 1.4826 · MAD(Δtrace) / √2</code>.
+                    Events are detected where ΔF/F₀ exceeds 5σ above baseline, with a refractory
+                    period of 2× the indicator decay time to prevent double-counting.
+                </p>
+            </div>
+        </div>
+
+        <!-- ─── Stage 4: Deconvolution ─── -->
+        <div class="stage fade-in">
+            <p class="stage-number">Stage 04</p>
+            <h2>Spike Inference</h2>
+            <p class="stage-desc">
+                The slow calcium indicator dynamics (Fluo-4 τ ≈ 400 ms) blur the timing of
+                underlying neural events. OASIS deconvolution recovers a sparse spike train
+                by fitting a constrained AR(1) model — the denoised trace captures the calcium
+                dynamics while the inferred spikes recover discrete event times and amplitudes.
+            </p>
+            <div class="stage-figure">
+                <img src="figures/fig4_deconvolution.png" alt="OASIS deconvolution panels">
+                <p class="stage-caption">
+                    <strong>Top:</strong> Raw ΔF/F₀ trace.
+                    <strong>Middle:</strong> OASIS denoised calcium signal.
+                    <strong>Bottom:</strong> Inferred spike train — sparse discrete events
+                    recovered from the continuous fluorescence.
+                </p>
+            </div>
+            <div class="method-box">
+                <h4>Method Detail</h4>
+                <p>
+                    OASIS (Friedrich et al. 2017) solves a constrained non-negative deconvolution
+                    problem with an AR(1) decay kernel matched to the calcium indicator kinetics.
+                    Minimum spike size <code>s_min = 0.1</code> and a noise gate at 3.5σ suppress
+                    spurious detections from baseline fluctuations.
+                </p>
+            </div>
+        </div>
+
+        <!-- ─── Stage 5: Motion Correction ─── -->
+        <div class="stage fade-in">
+            <p class="stage-number">Stage 05</p>
+            <h2>Motion Correction</h2>
+            <p class="stage-desc">
+                Sample drift during recording is corrected via rigid registration — each frame
+                is aligned to a reference template using phase-correlation, producing sub-pixel
+                displacement estimates. This is applied before trace extraction to prevent
+                spatial contamination between neighbouring ROIs.
+            </p>
+            <div class="stage-figure">
+                <img src="figures/fig5_motion_correction.png" alt="Motion correction shifts">
+                <p class="stage-caption">
+                    <strong>Left:</strong> Frame-by-frame Y and X displacement over time.
+                    <strong>Right:</strong> Distribution of total shift magnitudes across all frames.
+                </p>
+            </div>
+        </div>
+
+    </div>
+
+    <footer>
+        <p>Jamie Wilson · 2026</p>
+        <a href="https://jamiewilson0209.github.io/">← Back to home</a>
+    </footer>
+
+    <script>
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('visible');
+                }
+            });
+        }, { threshold: 0.1 });
+
+        document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+    </script>
+
+</body>
+</html>
