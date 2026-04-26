@@ -1,7 +1,7 @@
 # Calcium Imaging Pipeline
 
 A neuron detection and trace extraction pipeline for calcium imaging data,
-designed for organoid preparations with irregular neuron morphology.
+designed for organoid preparations using 1-photon confocal microscopy.
 Currently functional and under active development.
 
 ## Features
@@ -26,7 +26,7 @@ Currently functional and under active development.
 ## Installation
 
 ```bash
-git clone <repository>
+git clone https://github.com/JamieWilson0209/calcium-pipeline.git
 cd calcium_pipeline
 
 # Core dependencies
@@ -191,7 +191,6 @@ C_dff, _, info = compute_dff_traces(C_raw, frame_rate=cfg.imaging.frame_rate)
 - **CaImAn NoRMCorre**: Pnevmatikakis & Giovannucci, J. Neurosci. Methods 2017
 - **OASIS**: Friedrich et al., PLoS Comp Biol 2017
 - **LoG blob detection**: Lindeberg, IJCV 1998
-
+- **Otsu contour extraction**: Otsu, IEEE 1979
 ## License
 
-MIT License
