@@ -6,6 +6,9 @@
 #$ -j y
 #$ -V
 
+
+# Developed as needed over time, needs reworking and script separation
+
 # =============================================================================
 # Calcium Pipeline v2.1 with Contour-Based Detection
 # =============================================================================
