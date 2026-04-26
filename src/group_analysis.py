@@ -2,6 +2,8 @@
 Dataset Comparison & Quality Analysis Module
 =============================================
 
+*Everything was built on top as needed during development, needs heavy refractoring
+
 Comparative analysis of calcium imaging datasets from iPSC-derived
 brain organoids.  Presents data as-is without forced clustering or
 group assignments — the researcher interprets the patterns.
