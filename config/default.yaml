@@ -123,8 +123,6 @@ deconvolution:
 # ── Output & Visualisation ───────────────────────────────────────────────
 output:
   gallery: false              # interactive HTML inspection gallery
-  movie_gallery: false        # MP4 movie overlay viewer
-  movie_gallery_subsample: 4  # temporal subsampling factor
 
 
 # ── Quality Thresholds (Group Analysis) ──────────────────────────────────
@@ -141,7 +139,7 @@ quality:
   genotype_map:
     '3': Control
     default: Mutant
-  mutant_label: CEP41 R242H    # display label for mutant group in figures
+  mutant_label: Mutant    # display label for mutant group in figures
   roi_peak_figures: false      # per-ROI peak frame PNGs (slow, off by default)
 
 
