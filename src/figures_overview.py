@@ -7,14 +7,28 @@ Split from group_analysis.py for maintainability.
 
 Imported by group_analysis.run_analysis().
 """
-
+#Standard Library
 import os
 import logging
-import numpy as np
+import re
+from collections import OrderedDict
+from pathlib import Path
+from typing import List, Optional
 
+#Third-Party
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+from matplotlib.colors import Normalize
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from scipy import stats as sp_stats
+from scipy.cluster.hierarchy import leaves_list, linkage
+from sklearn.preprocessing import StandardScaler
+
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +51,6 @@ except ImportError:
         _flag_suspicious_neurons,
         build_feature_matrix,
     )
-
-from typing import List, Optional
 
 
 # =============================================================================
@@ -105,9 +117,6 @@ def generate_figures(
             ├── D109_R1/
             ...
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
 
     # Create new directory structure matching user preferences
     base_dir = output_dir
@@ -129,7 +138,6 @@ def generate_figures(
     colors = {1: default_color}
 
     # ── Main Results figures ───────────────────────────────────────────────
-    from sklearn.preprocessing import StandardScaler
     X_std = StandardScaler().fit_transform(X)
     paths.append(_fig_feature_heatmap(X_std, names, feat_labels, labels, dirs['main_results']))
     paths.append(_fig_neuron_distributions(datasets, labels, colors, dirs['overview']))
@@ -147,8 +155,6 @@ def generate_figures(
 
 
 def _fig_feature_heatmap(X_std, names, feat_labels, labels, output_dir):
-    import matplotlib.pyplot as plt
-    from scipy.cluster.hierarchy import leaves_list, linkage
 
     abbrevs = [_abbrev(n) for n in names]
     fig, ax = plt.subplots(figsize=(max(10, len(names) * 0.5), 8))
@@ -183,7 +189,6 @@ def _fig_feature_heatmap(X_std, names, feat_labels, labels, output_dir):
 
 def _fig_neuron_distributions(datasets, labels, colors, output_dir):
     """Per-neuron distributions from selected neurons, pooled across all datasets."""
-    import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     metrics = [
@@ -233,11 +238,7 @@ def _fig_raster_plots_split(datasets, labels, colors, raster_dir, per_dataset_di
     - rasters/<dataset_name>.png — individual raster plots
     - per_dataset/<n>/raster.png — detailed raster in per-dataset folder
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-    
+
     os.makedirs(raster_dir, exist_ok=True)
     paths = []
     
@@ -382,12 +383,7 @@ def _fig_correlation_matrices_split(datasets, labels, colors, corr_dir, per_data
     - correlations/<dataset_name>.png  — individual correlation matrices
     - per_dataset/<name>/correlation.png — copy in per-dataset folder
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-    from scipy.cluster.hierarchy import linkage, leaves_list
-    
+
     os.makedirs(corr_dir, exist_ok=True)
     paths = []
     
@@ -487,11 +483,6 @@ def _fig_correlation_matrices_split(datasets, labels, colors, corr_dir, per_data
 
 def _fig_population_activity(datasets, labels, colors, output_dir):
     """Dataset-level metrics as labelled scatter + bar summary with organoid colors."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    from collections import OrderedDict
 
     metrics = [
         ('mean_spike_rate',          'Spike Rate\n(events/10s)'),
@@ -560,7 +551,6 @@ def _fig_population_activity(datasets, labels, colors, output_dir):
 def _draw_bar_panel(ax, key, ylabel, has_neurons, per_ds, ds_names, n_ds,
                     bar_width=0.65):
     """Draw a single bar chart panel. Shared by combined and individual figures."""
-    from scipy import stats as sp_stats
 
     BASE_COLOR = '#5B8DBE'
     FLAG_COLOR_FEW = '#B8D4E8'   # light tint when few flagged
@@ -658,11 +648,6 @@ def fig_flagged_neurons(datasets, per_dataset_dir):
     - Right panel: raw trace (gray, left axis) and denoised trace (green,
       right axis) on separate scales, with spike markers.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from matplotlib.colors import Normalize
 
     print(f"\n=== FLAGGED NEURON INSPECTION ===")
     print(f"  Checking {len(datasets)} datasets")
@@ -887,10 +872,6 @@ def _fig_bar_charts(datasets, labels, colors, output_dir, per_metric_dir=None):
 
     Produces a combined 4-panel figure AND individual per-metric figures.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
     n_ds = len(datasets)
     if n_ds == 0:
@@ -1070,9 +1051,6 @@ def fig_neuron_selection(datasets, output_dir, per_dataset_dir=None):
     - per_dataset/<name>/neuron_selection.png  per dataset
     - overview/neuron_selection.png            combined overview
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
 
     n_ds = len(datasets)
     sel_base = per_dataset_dir or os.path.join(output_dir, 'Results by Dataset')
@@ -1118,9 +1096,6 @@ def fig_neuron_selection(datasets, output_dir, per_dataset_dir=None):
 
 def fig_quality_gating(datasets, max_thresh, res_thresh, drift_thresh, output_dir):
     """Show all quality metrics for all datasets with exclusion thresholds."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
 
     names = [_abbrev(d.name) for d in datasets]
     max_shifts = [d.motion_max_shift for d in datasets]
@@ -1217,7 +1192,6 @@ def fig_quality_gating(datasets, max_thresh, res_thresh, drift_thresh, output_di
                  fontsize=13, fontweight='bold', y=1.02)
 
     # Legend for colours
-    from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor='#5B8DBE', edgecolor='#333', label='Included'),
         Patch(facecolor='#FF5252', edgecolor='#333', label='Excluded (this criterion)'),
@@ -1250,10 +1224,7 @@ def fig_selected_traces(datasets: List[DatasetMetrics], output_dir: str) -> List
     Saves all figures to:
         {output_dir}/figures/Selected Traces/{recording_name}.png
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from pathlib import Path
+
 
     traces_dir = os.path.join(output_dir, 'figures', 'Selected Traces')
     os.makedirs(traces_dir, exist_ok=True)
@@ -1430,11 +1401,7 @@ def fig_n_selected_distribution(datasets: List, output_dir: str,
 
     Saved to figures/Full Overview/n_selected_distribution.png at 300 DPI.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    import re
+
 
     overview_dir = os.path.join(output_dir, 'figures', 'Full Overview')
     os.makedirs(overview_dir, exist_ok=True)
