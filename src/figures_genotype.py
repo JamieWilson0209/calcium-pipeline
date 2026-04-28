@@ -9,15 +9,36 @@ and ROI peak frame generation.
 Split from group_analysis.py for maintainability.
 
 Imported by group_analysis.run_analysis().
+
+Status: Refactoring
 """
 
 import os
 import logging
-import numpy as np
+import traceback
+from collections import OrderedDict
+from typing import List, Optional, Dict, Any, Tuple
+import re
+from pathlib import Path
 
+#Scientific stack
+import numpy as np
+import pandas as pd
+from scipy import stats as sp_stats
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import pdist
+from scipy.sparse import load_npz
+from scipy.ndimage import percentile_filter
+from sklearn.preprocessing import StandardScaler
+
+#Visualisation stack
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patheffects as path_effects
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +72,17 @@ try:
 except ImportError:
     from figures_overview import _fmt_p, _sig_stars, _draw_sig_bracket
 
-from typing import List, Optional, Dict, Any, Tuple
-from collections import OrderedDict
+#Global Logger
+logger = logging.getLogger(__name__)
 
+
+# Refactored Constants
+DEFAULT_PALETTE = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+]
+CTRL_COLOR = '#4472C4'
+MUT_COLOR = '#ED7D31'
 
 # =============================================================================
 # ORGANOID-LEVEL FIGURES
@@ -62,12 +91,6 @@ from collections import OrderedDict
 def _fig_spike_rate_by_organoid(datasets, organoid_ids, unique_organoids,
                                  org_colors, output_dir):
     """Spike rate by organoid dot plot with per-day grouping."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    from collections import OrderedDict
-    import re
 
     def _extract_day_rec(name):
         date_match = re.search(r'(\d{6})', name)
@@ -165,12 +188,6 @@ def _fig_spike_rate_by_organoid(datasets, organoid_ids, unique_organoids,
 def _fig_correlation_by_organoid(datasets, organoid_ids, unique_organoids,
                                   org_colors, output_dir):
     """Pairwise correlation by organoid dot plot with per-day grouping."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from collections import OrderedDict
-    import re
 
     def _extract_day_rec(name):
         date_match = re.search(r'(\d{6})', name)
@@ -259,12 +276,6 @@ def _fig_correlation_by_organoid(datasets, organoid_ids, unique_organoids,
 def _fig_synchrony_by_organoid(datasets, organoid_ids, unique_organoids,
                                 org_colors, output_dir):
     """Synchrony index by organoid dot plot with per-day grouping."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-    from collections import OrderedDict
-    import re
 
     def _extract_day_rec(name):
         date_match = re.search(r'(\d{6})', name)
@@ -363,8 +374,6 @@ def run_statistical_tests(datasets: List[DatasetMetrics], output_dir: str) -> di
     Produces three by-organoid figures (spike rate, correlation, synchrony)
     and computes Kruskal-Wallis + pairwise Mann-Whitney U tests on spike rates.
     """
-    from scipy import stats as sp_stats
-    from collections import OrderedDict
 
     n_ds = len(datasets)
     results = {
@@ -480,18 +489,7 @@ def run_dataset_overview(datasets: List[DatasetMetrics], output_dir: str) -> dic
     - dataset_heatmap.png — Clustered heatmap of standardized features  
     - metric_*.png — Individual metric plots grouped by organoid and day
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    from matplotlib.lines import Line2D
-    import matplotlib.patheffects as path_effects
-    from sklearn.preprocessing import StandardScaler
-    from scipy.cluster import hierarchy
-    from scipy.spatial.distance import pdist
-    from collections import OrderedDict
-    import re
-    
+
     n_ds = len(datasets)
     results = {'n_datasets': n_ds, 'visualizations': []}
     
@@ -557,7 +555,6 @@ def run_dataset_overview(datasets: List[DatasetMetrics], output_dir: str) -> dic
         fig.patch.set_facecolor('white')
         
         # Create gridspec with proper spacing for dendrogram
-        import matplotlib.gridspec as gridspec
         gs = gridspec.GridSpec(1, 3, width_ratios=[0.2, 1, 0.05], wspace=0.05)
         
         # Hierarchical clustering
@@ -766,12 +763,7 @@ def run_genotype_comparison(datasets: List[DatasetMetrics], output_dir: str,
     dict : Full results including per-day breakdowns, pooled tests, and
            meta-analysis across days.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from scipy import stats as sp_stats
-    from collections import OrderedDict
+
 
     results = {'level': 'genotype', 'tests': {}}
 
@@ -1723,11 +1715,10 @@ def run_genotype_comparison(datasets: List[DatasetMetrics], output_dir: str,
                 ax.grid(axis='y', alpha=0.2)
 
             # Legend
-            from matplotlib.patches import Patch as _Patch
             legend_handles = []
             for line_id in all_lines:
                 geno = 'Ctrl' if line_id.startswith('3') else 'Mut'
-                legend_handles.append(_Patch(
+                legend_handles.append(Patch(
                     facecolor=line_colors.get(line_id, '#999'),
                     alpha=0.7, label=f'{line_id} ({geno})'))
             axes_lines[0].legend(handles=legend_handles, fontsize=8,
@@ -1890,10 +1881,6 @@ def _run_mixed_model_analysis(
 
     3. Permutation test: model-free, shuffles genotype labels across recording means.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from scipy import stats as sp_stats
 
     logger.info("Running mixed-effects model analysis...")
 
@@ -2108,13 +2095,8 @@ def _fig_mixed_model_panel(
       Right: coefficient comparison across methods (raw units, not normalised)
     Plus a summary table.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
-    CTRL_COLOR = '#4472C4'
-    MUT_COLOR = '#ED7D31'
+
     rng = np.random.default_rng(42)
 
     n_metrics = len(metrics)
@@ -2402,12 +2384,6 @@ def run_between_organoid_tests(datasets: List[DatasetMetrics], output_dir: str) 
     Only runs if there are 2+ distinct organoids. Returns empty dict
     and skips figure generation if only one organoid is present.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from scipy import stats as sp_stats
-    from collections import OrderedDict
 
     results = {'level': 'between-organoid', 'tests': {}}
 
@@ -2854,13 +2830,6 @@ def run_activity_analysis(datasets: List[DatasetMetrics], output_dir: str,
 
     Figures saved to: figures/3 - Activity Analysis/
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from scipy import stats as sp_stats
-    from collections import OrderedDict
-    import re
 
     results = {'level': 'activity_analysis'}
 
@@ -3074,7 +3043,6 @@ def run_activity_analysis(datasets: List[DatasetMetrics], output_dir: str,
         ax.grid(axis='y', alpha=0.15)
 
     # Legend
-    from matplotlib.lines import Line2D
     legend_elements = [Line2D([0], [0], marker='o', color='w', markerfacecolor=CTRL_COLOR, markersize=8, label='Control'),
                        Line2D([0], [0], marker='o', color='w', markerfacecolor=MUT_COLOR, markersize=8, label=mutant_label)]
     axes[2].legend(handles=legend_elements, loc='upper right', fontsize=13)
@@ -3184,13 +3152,6 @@ def generate_roi_peak_figures(datasets: List, output_dir: str) -> None:
 
     Output: figures/ROI Peak Frames/{recording_name}/rank{N:03d}_roi{M:04d}.png
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from pathlib import Path
-    from scipy.sparse import load_npz
-    from scipy.ndimage import percentile_filter
 
     out_root = os.path.join(output_dir, 'figures', 'ROI Peak Frames')
     os.makedirs(out_root, exist_ok=True)
