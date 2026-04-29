@@ -3,95 +3,77 @@ Auto Radius Optimisation
 ========================
 
 Automatically selects the detection radius parameters that maximise the
-number of high-SNR calcium traces in a dataset.
-
-Unlike simple blob-counting approaches, this module optimises for what
-actually matters: clean traces with clear activity spikes.
+median Otsu inter-class variance across all detected blobs.
 
 Algorithm
 ---------
-1. Compute projections from the movie (fast)
-2. For each candidate radius in the sweep range:
-   a. Run blob detection + contour fitting
-   b. Build spatial footprints
-   c. Extract traces (fast weighted-average, no neuropil)
-   d. Score each trace's SNR (peak amplitude / MAD noise)
-   e. Count traces exceeding SNR threshold
-3. Select the radius that yields the most high-SNR detections
-4. Generate diagnostic figure comparing all candidates
+1. Compute projections once (shared read-only across all candidates)
+2. Run N candidate radius settings in parallel, each:
+   a. Blob detection + contour fitting
+   b. Collect per-blob Otsu inter-class variance from diagnostics
+   c. Score as median variance across successful contours only
+3. Select the candidate with the highest median inter-class variance
 
-This runs ~5 candidate radii in parallel-friendly fashion.  Total time
-is roughly 5× the detection stage (typically 30–120 s per dataset).
+Scoring rationale
+-----------------
+Otsu thresholding maximises the inter-class variance between foreground
+(cell body) and background pixels:
+
+    σ²_between = w_bg × w_fg × (μ_bg − μ_fg)²
+
+A radius setting that matches the true cell size produces clean bimodal
+ROI histograms with high inter-class variance.  A mismatched radius
+(too small: ROI clips the cell; too large: background dilutes the
+foreground) blurs the histogram and reduces separation.  This metric is
+purely geometric — it is independent of neural activity levels and
+unaffected by the noise-averaging artefact that biases SNR-based scoring
+toward larger ROIs.
+
+Parallelisation
+---------------
+Candidates are independent — they share only read-only inputs (movie,
+projections) — so they map cleanly onto a joblib worker pool.  The same
+code runs on Eddie (fork, multi-core SGE job) and locally (spawn on Mac,
+fork on Linux) without modification.  Pool size is capped at the number
+of available cores so the job respects its SGE allocation.
 """
 
-import numpy as np
 import logging
+import os
 import time
-from typing import Dict, Tuple
-from scipy.sparse import issparse
+from typing import Dict, List, Tuple
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Default SNR threshold: traces must have peak-to-noise ratio above this
-# to count as "high quality".  5.0 is a common minimum in the literature
-# for reliable transient detection (CaImAn, Suite2p use similar).
-DEFAULT_SNR_THRESHOLD = 5.0
 
+# =============================================================================
+# SINGLE CANDIDATE EVALUATION
+# =============================================================================
 
-def estimate_trace_snr(traces: np.ndarray) -> np.ndarray:
-    """
-    Compute per-trace SNR as robust peak amplitude / MAD noise.
-
-    Parameters
-    ----------
-    traces : array (N, T)
-
-    Returns
-    -------
-    snr : array (N,)
-        Zero for traces with negligible noise floor.
-    """
-    diff = np.diff(traces, axis=1)                          # (N, T-1)
-    medians = np.median(diff, axis=1, keepdims=True)        # (N, 1)
-    mad = np.median(np.abs(diff - medians), axis=1)         # (N,)
-    noise = 1.4826 * mad / np.sqrt(2)                       # (N,)
-
-    peak = (np.percentile(traces, 95, axis=1)
-            - np.percentile(traces, 5, axis=1))             # (N,)
-
-    snr = np.zeros(traces.shape[0])
-    valid = noise > 1e-10
-    snr[valid] = peak[valid] / noise[valid]
-    return snr
-
-
-def _run_candidate(
+def _evaluate_candidate(
     movie: np.ndarray,
     min_radius: float,
     max_radius: float,
     smooth_sigma: float,
-    snr_threshold: float,
-    max_seeds: int = 500,
-    precomputed_projections=None,
+    max_seeds: int,
+    precomputed_projections,
 ) -> Dict:
-    """Run detection + quick trace extraction at one radius setting."""
-    try:
-        from .contour_seed_detection import (
-            detect_seeds_with_contours,
-            contours_to_spatial_footprints,
-        )
-    except ImportError:
-        from contour_seed_detection import (
-            detect_seeds_with_contours,
-            contours_to_spatial_footprints,
-        )
+    """
+    Run detection for one radius candidate and return its median Otsu
+    inter-class variance across all blobs with successful contours.
 
-    T, d1, d2 = movie.shape
-    dims = (d1, d2)
+    Designed to be called inside a joblib worker — all inputs are read-only
+    and the return value is a plain dict of scalars.
+    """
+    try:
+        from contour_seed_detection import detect_seeds_with_contours
+    except ImportError:
+        from .contour_seed_detection import detect_seeds_with_contours
 
     t0 = time.time()
 
-    # Detection
     try:
         seeds = detect_seeds_with_contours(
             movie,
@@ -101,293 +83,270 @@ def _run_candidate(
             correlation_threshold=0.12,
             border_margin=10,
             max_seeds=max_seeds,
-            contour_method='otsu',
             smooth_sigma=smooth_sigma,
-            use_temporal_projection=True,
             n_peak_frames=10,
             peak_percentile=90,
             precomputed_projections=precomputed_projections,
         )
-    except Exception as e:
-        logger.warning(f"    Detection failed at r=[{min_radius},{max_radius}]: {e}")
+    except Exception as exc:
+        logger.warning(f"    Detection failed at r=[{min_radius}, {max_radius}]: {exc}")
         return _empty_result(min_radius, max_radius)
 
-    n_seeds = seeds.n_seeds
-    if n_seeds == 0:
+    if seeds.n_seeds == 0:
         return _empty_result(min_radius, max_radius)
 
-    # Build footprints
-    A = contours_to_spatial_footprints(seeds, dims, contour_fallback=True)
+    # Collect inter-class variance from each blob's diagnostics.
+    # Only blobs where Otsu succeeded are included — failures are excluded
+    # entirely rather than penalised with a zero.
+    variances = [
+        d['otsu_inter_class_variance']
+        for d in seeds.diagnostics.get('per_blob', [])
+        if d.get('success') and 'otsu_inter_class_variance' in d
+    ]
 
-    # Quick trace extraction (weighted average, no neuropil, no chunking)
-    A_dense = A.toarray().astype(np.float32) if issparse(A) else A.astype(np.float32)
-    weights = A_dense.sum(axis=0)
-    weights[weights == 0] = 1e-10
-
-    # Extract on a subset of frames for speed (every Nth frame)
-    stride = max(1, T // 500)
-    Y_sub = movie[::stride].reshape(-1, d1 * d2).T  # (pixels, T_sub)
-    C_sub = (A_dense.T @ Y_sub) / weights[:, np.newaxis]  # (N, T_sub)
-
-    # SNR
-    snr = estimate_trace_snr(C_sub)
-    n_good = int(np.sum(snr >= snr_threshold))
-    mean_snr = float(np.mean(snr)) if len(snr) > 0 else 0.0
-    median_snr = float(np.median(snr)) if len(snr) > 0 else 0.0
-
-    # Also compute top-quartile SNR (quality of the best detections)
-    if len(snr) >= 4:
-        top_q_snr = float(np.mean(np.sort(snr)[-max(1, len(snr) // 4):]))
-    else:
-        top_q_snr = mean_snr
-
-    elapsed = time.time() - t0
+    median_variance = float(np.median(variances)) if variances else 0.0
 
     return {
-        'min_radius': min_radius,
-        'max_radius': max_radius,
-        'n_seeds': n_seeds,
-        'n_good': n_good,
-        'mean_snr': mean_snr,
-        'median_snr': median_snr,
-        'top_quartile_snr': top_q_snr,
-        'snr_values': snr,
-        'radii': seeds.radii,
-        'elapsed': elapsed,
+        'min_radius':      min_radius,
+        'max_radius':      max_radius,
+        'n_seeds':         seeds.n_seeds,
+        'n_contours':      seeds.n_contours,
+        'median_variance': median_variance,
+        'variances':       variances,
+        'elapsed':         time.time() - t0,
     }
 
 
-def _empty_result(min_r, max_r):
+def _empty_result(min_r: float, max_r: float) -> Dict:
     return {
-        'min_radius': min_r,
-        'max_radius': max_r,
-        'n_seeds': 0,
-        'n_good': 0,
-        'mean_snr': 0.0,
-        'median_snr': 0.0,
-        'top_quartile_snr': 0.0,
-        'snr_values': np.array([]),
-        'radii': np.array([]),
-        'elapsed': 0.0,
+        'min_radius':      min_r,
+        'max_radius':      max_r,
+        'n_seeds':         0,
+        'n_contours':      0,
+        'median_variance': 0.0,
+        'variances':       [],
+        'elapsed':         0.0,
     }
 
+
+# =============================================================================
+# CANDIDATE GENERATION
+# =============================================================================
+
+def _generate_candidates(
+    radius_range: Tuple[float, float],
+    n_candidates: int,
+) -> List[Tuple[float, float]]:
+    """
+    Generate evenly spaced (min_radius, max_radius) candidate pairs across
+    the sweep range.  Each candidate uses max_radius = 2× min_radius.
+    Duplicates are removed.
+    """
+    r_min, r_max = radius_range
+    centers = np.linspace(r_min * 1.5, r_max * 0.7, n_candidates)
+
+    seen = set()
+    candidates = []
+    for c in centers:
+        mn = round(max(r_min, c * 0.5), 1)
+        mx = round(min(r_max, c * 2.0), 1)
+        if mx <= mn:
+            mx = round(mn * 2.0, 1)
+        if (mn, mx) not in seen:
+            seen.add((mn, mx))
+            candidates.append((mn, mx))
+
+    return candidates
+
+
+# =============================================================================
+# MAIN OPTIMISATION
+# =============================================================================
 
 def optimise_radius(
     movie: np.ndarray,
     smooth_sigma: float = 4.0,
-    snr_threshold: float = DEFAULT_SNR_THRESHOLD,
     n_candidates: int = 5,
     radius_range: Tuple[float, float] = (3.0, 35.0),
     max_seeds: int = 500,
     precomputed_projections=None,
 ) -> Dict:
     """
-    Sweep radius values and select the one producing the most high-SNR traces.
+    Sweep radius candidates in parallel and select the one with the highest
+    median Otsu inter-class variance across detected blobs.
 
     Parameters
     ----------
-    movie : array (T, d1, d2)
+    movie : ndarray (T, d1, d2)
     smooth_sigma : float
-        Gaussian smoothing sigma for hotspot suppression.
-    snr_threshold : float
-        Minimum trace SNR to count as "good" (default 5.0).
+        Gaussian smoothing sigma — should match the value used in the main
+        pipeline so projections are comparable.
     n_candidates : int
-        Number of radius settings to test (default 5).
+        Number of radius settings to test.
     radius_range : (float, float)
-        Min and max of the radius sweep range.
+        Min and max bounds of the radius sweep.
     max_seeds : int
-        Max seeds per candidate (keeps it fast).
+        Detection cap per candidate — controls runtime.
     precomputed_projections : ProjectionSet, optional
-        If provided, skip the internal projection computation and reuse these
-        across all candidates.  Useful when the caller will also use the same
-        projections downstream.
+        Reuse projections already computed upstream.  Passed read-only to
+        all worker processes.
 
     Returns
     -------
-    dict with:
-        'best_min_radius', 'best_max_radius' : selected values
-        'best_n_good' : number of high-SNR detections at best radius
-        'candidates' : list of per-candidate results
-        'reliable' : bool
+    dict with keys:
+        'best_min_radius', 'best_max_radius'
+        'best_median_variance'
+        'reliable' : bool  (True if best candidate found >= 3 contours)
+        'candidates' : list of per-candidate summary dicts
+        'all_results' : full result list (includes variances, for figures)
     """
-    r_min, r_max = radius_range
+    candidates = _generate_candidates(radius_range, n_candidates)
+    n_workers  = min(len(candidates), os.cpu_count() or 1)
 
-    # Generate candidate radius pairs
-    # Each candidate has a min_radius and max_radius = min_radius * 2.5
-    # (detections are typically 1–2.5× the minimum radius)
-    centers = np.linspace(r_min * 1.5, r_max * 0.7, n_candidates)
-    candidates = []
-    for c in centers:
-        mn = max(r_min, c * 0.5)
-        mx = min(r_max, c * 2.0)
-        if mx <= mn:
-            mx = mn * 2.0
-        candidates.append((round(mn, 1), round(mx, 1)))
+    logger.info(f"  Auto-radius: {len(candidates)} candidates, "
+                f"{n_workers} parallel workers")
 
-    # Deduplicate
-    seen = set()
-    unique = []
-    for pair in candidates:
-        key = (pair[0], pair[1])
-        if key not in seen:
-            seen.add(key)
-            unique.append(pair)
-    candidates = unique
-
-    logger.info(f"  Auto-radius: testing {len(candidates)} candidates "
-                f"(SNR threshold={snr_threshold})")
-
-    # Compute projections once — they're invariant across radius candidates.
-    # Reuse the caller's projections if provided.
+    # Shared projections
     if precomputed_projections is not None:
         logger.info("  Reusing precomputed projections")
         shared_projections = precomputed_projections
     else:
         try:
-            from .contour_seed_detection import compute_projections_extended
+            from contour_seed_detection import compute_projections
         except ImportError:
-            from contour_seed_detection import compute_projections_extended
-        logger.info("  Computing projections once for all candidates...")
-        proj_t0 = time.time()
-        shared_projections = compute_projections_extended(
-            movie, compute_correlation=True, smooth_sigma=smooth_sigma,
+            from .contour_seed_detection import compute_projections
+        logger.info("  Computing projections for radius sweep...")
+        t0 = time.time()
+        shared_projections = compute_projections(
+            movie, smooth_sigma=smooth_sigma, compute_correlation=True,
         )
-        logger.info(f"  Projections ready ({time.time() - proj_t0:.1f}s)")
+        logger.info(f"  Projections ready ({time.time() - t0:.1f}s)")
 
-    results = []
-    for mn, mx in candidates:
-        logger.info(f"    r=[{mn:.1f}, {mx:.1f}] ...")
-        res = _run_candidate(
-            movie, mn, mx, smooth_sigma, snr_threshold, max_seeds,
-            precomputed_projections=shared_projections,
+    # Parallel candidate evaluation
+    try:
+        from joblib import Parallel, delayed
+        results = Parallel(n_jobs=n_workers, prefer='threads')(
+            delayed(_evaluate_candidate)(
+                movie, mn, mx, smooth_sigma, max_seeds, shared_projections,
+            )
+            for mn, mx in candidates
         )
-        results.append(res)
-        logger.info(f"      → {res['n_seeds']} seeds, {res['n_good']} good "
-                     f"(SNR≥{snr_threshold}), mean SNR={res['mean_snr']:.1f}, "
-                     f"{res['elapsed']:.1f}s")
+    except ImportError:
+        logger.warning("  joblib not found — running candidates sequentially")
+        results = [
+            _evaluate_candidate(
+                movie, mn, mx, smooth_sigma, max_seeds, shared_projections,
+            )
+            for mn, mx in candidates
+        ]
 
-    # Select best: maximise n_good, break ties with top-quartile SNR
-    best_idx = 0
-    best_score = (-1, -1.0)
-    for i, res in enumerate(results):
-        score = (res['n_good'], res['top_quartile_snr'])
-        if score > best_score:
-            best_score = score
-            best_idx = i
+    for res in results:
+        logger.info(
+            f"    r=[{res['min_radius']:.1f}, {res['max_radius']:.1f}]  "
+            f"seeds={res['n_seeds']}  contours={res['n_contours']}  "
+            f"median_variance={res['median_variance']:.1f}  "
+            f"({res['elapsed']:.1f}s)"
+        )
 
-    best = results[best_idx]
-    reliable = best['n_good'] >= 3
+    # Select best candidate by median inter-class variance
+    best = max(results, key=lambda r: r['median_variance'])
 
-    logger.info(f"  Auto-radius: BEST r=[{best['min_radius']:.1f}, "
-                f"{best['max_radius']:.1f}] → {best['n_good']} good detections "
-                f"(mean SNR={best['mean_snr']:.1f})")
+    logger.info(
+        f"  Auto-radius: BEST r=[{best['min_radius']:.1f}, "
+        f"{best['max_radius']:.1f}]  "
+        f"median_variance={best['median_variance']:.1f}  "
+        f"n_contours={best['n_contours']}"
+    )
 
     return {
-        'best_min_radius': best['min_radius'],
-        'best_max_radius': best['max_radius'],
-        'best_n_good': best['n_good'],
-        'best_mean_snr': best['mean_snr'],
-        'best_top_quartile_snr': best['top_quartile_snr'],
-        'snr_threshold': snr_threshold,
+        'best_min_radius':      best['min_radius'],
+        'best_max_radius':      best['max_radius'],
+        'best_median_variance': best['median_variance'],
+        'reliable':             best['n_contours'] >= 3,
         'candidates': [
-            {k: v for k, v in r.items()
-             if k not in ('snr_values', 'radii')}
+            {k: v for k, v in r.items() if k != 'variances'}
             for r in results
         ],
-        'reliable': reliable,
-        'all_results': results,  # kept for figure generation
+        'all_results': results,
     }
 
+
+# =============================================================================
+# DIAGNOSTIC FIGURE
+# =============================================================================
 
 def generate_radius_figure(
     radius_result: Dict,
     output_path: str,
 ) -> str:
-    """Save diagnostic figure showing the radius optimisation."""
+    """
+    Save a 2-panel diagnostic figure for the radius optimisation sweep.
+
+    Panel A — median Otsu inter-class variance per candidate (scoring metric)
+    Panel B — variance distributions per candidate (CDF)
+    """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    results = radius_result['all_results']
-    snr_thresh = radius_result['snr_threshold']
+    results  = radius_result['all_results']
+    best_idx = next(
+        i for i, r in enumerate(results)
+        if r['min_radius'] == radius_result['best_min_radius']
+        and r['max_radius'] == radius_result['best_max_radius']
+    )
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    x      = np.arange(len(results))
+    labels = [f"[{r['min_radius']:.0f},{r['max_radius']:.0f}]" for r in results]
 
-    # Panel subheadings
+    BEST_COLOUR = '#e94560'
+    BASE_COLOUR = 'steelblue'
 
-    panel_labels = ['A', 'B', 'C']
-    for ax, label in zip(axes, panel_labels):
-        ax.text(-0.1, 1.05, label, transform=ax.transAxes,
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, panel in zip(axes, ['A', 'B']):
+        ax.text(-0.1, 1.05, panel, transform=ax.transAxes,
                 fontsize=24, fontweight='bold', va='top', ha='right')
 
-    # 1. N good detections vs radius
+    # Panel A: Median inter-class variance per candidate
     ax = axes[0]
-    radii_labels = [f"[{r['min_radius']:.0f},{r['max_radius']:.0f}]" for r in results]
-    n_good = [r['n_good'] for r in results]
-    n_total = [r['n_seeds'] for r in results]
-
-    x = np.arange(len(results))
-    bars = ax.bar(x, n_good, color='steelblue', edgecolor='black', alpha=0.7,
-                  label=f'SNR ≥ {snr_thresh}')
-    ax.bar(x, [t - g for t, g in zip(n_total, n_good)], bottom=n_good,
-           color='lightgray', edgecolor='black', alpha=0.5, label='Below threshold')
-
-    best_idx = max(range(len(results)), key=lambda i: (results[i]['n_good'], results[i]['top_quartile_snr']))
-    bars[best_idx].set_color('#e94560')
-
+    colours = [BEST_COLOUR if i == best_idx else BASE_COLOUR
+               for i in range(len(results))]
+    ax.bar(x, [r['median_variance'] for r in results],
+           color=colours, edgecolor='black', alpha=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(radii_labels, rotation=30, fontsize=16)
+    ax.set_xticklabels(labels, rotation=30, fontsize=11)
     ax.set_xlabel('Radius range [min, max] (px)')
-    ax.set_ylabel('Number of detections', fontsize=16)
-    ax.set_title('High-SNR Detections by Radius', fontsize=18)
-    ax.legend(fontsize=16)
+    ax.set_ylabel('Median Otsu inter-class variance', fontsize=12)
+    ax.set_title('Otsu Separation by Radius', fontsize=14)
 
-    # 2. SNR distributions per candidate
+    # Panel B: Variance CDFs
     ax = axes[1]
     for i, res in enumerate(results):
-        snr = res['snr_values']
-        if len(snr) > 0:
-            color = '#e94560' if i == best_idx else 'steelblue'
-            alpha = 0.9 if i == best_idx else 0.4
-            sorted_snr = np.sort(snr)
-            cdf = np.arange(1, len(sorted_snr) + 1) / len(sorted_snr)
-            ax.plot(sorted_snr, cdf, color=color, alpha=alpha,
-                    linewidth=2 if i == best_idx else 1,
-                    label=radii_labels[i])
+        variances = res['variances']
+        if not variances:
+            continue
+        sorted_v = np.sort(variances)
+        cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
+        ax.plot(sorted_v, cdf,
+                color=BEST_COLOUR if i == best_idx else BASE_COLOUR,
+                alpha=0.9 if i == best_idx else 0.4,
+                linewidth=2 if i == best_idx else 1,
+                label=labels[i])
+    ax.set_xlabel('Otsu inter-class variance', fontsize=12)
+    ax.set_ylabel('Cumulative fraction', fontsize=12)
+    ax.set_title('Variance Distributions', fontsize=14)
+    ax.set_xlim(left=0)
+    ax.legend(fontsize=10, loc='lower right')
 
-    ax.axvline(snr_thresh, color='red', linestyle='--', alpha=0.5,
-               label=f'Threshold={snr_thresh}')
-    ax.set_xlabel('Trace SNR', fontsize=16)
-    ax.set_ylabel('Cumulative fraction', fontsize=16)
-    ax.set_title('SNR Distributions', fontsize=18)
-    ax.legend(fontsize=16, loc='lower right')
-    ax.set_xlim(0, min(50, ax.get_xlim()[1]))
-
-    # 3. Mean SNR and top-quartile SNR
-    ax = axes[2]
-    mean_snrs = [r['mean_snr'] for r in results]
-    top_snrs = [r['top_quartile_snr'] for r in results]
-
-    ax.bar(x - 0.15, mean_snrs, width=0.3, color='steelblue', edgecolor='black',
-           alpha=0.7, label='Mean SNR')
-    ax.bar(x + 0.15, top_snrs, width=0.3, color='darkorange', edgecolor='black',
-           alpha=0.7, label='Top quartile SNR')
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(radii_labels, rotation=30, fontsize=16)
-    ax.set_xlabel('Radius range [min, max] (px)')
-    ax.set_ylabel('SNR', fontsize=16)
-    ax.set_title('SNR Quality', fontsize=18)
-    ax.legend(fontsize=16)
-
-    best_r = results[best_idx]
+    best = results[best_idx]
     fig.suptitle(
-        f"Auto-Radius Optimisation — Best: [{best_r['min_radius']:.0f}, "
-        f"{best_r['max_radius']:.0f}] px, "
-        f"{best_r['n_good']} detections with SNR ≥ {snr_thresh}",
-        fontsize=16, fontweight='bold'
+        f"Auto-Radius — Best: [{best['min_radius']:.0f}, {best['max_radius']:.0f}] px  "
+        f"median variance={best['median_variance']:.1f}  "
+        f"n_contours={best['n_contours']}",
+        fontsize=13, fontweight='bold',
     )
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
+
     return output_path

@@ -96,7 +96,6 @@ SMOOTH_SIGMA="${SMOOTH_SIGMA:-4.0}"
 BORDER_MARGIN="${BORDER_MARGIN:-20}"
 
 # Contour extraction
-USE_TEMPORAL_PROJECTION="${USE_TEMPORAL_PROJECTION:-true}"
 N_PEAK_FRAMES="${N_PEAK_FRAMES:-10}"
 PEAK_PERCENTILE="${PEAK_PERCENTILE:-90}"
 USE_MEAN_PROJ="${USE_MEAN_PROJ:-true}"   # blob detection on mean projection
@@ -148,7 +147,6 @@ echo ""
 echo "Detection:"
 echo "  Radius: ${MIN_RADIUS}-${MAX_RADIUS} px (auto: ${AUTO_RADIUS})"
 echo "  Smooth sigma: ${SMOOTH_SIGMA}"
-echo "  Temporal projection: ${USE_TEMPORAL_PROJECTION}"
 echo "  Use mean projection: ${USE_MEAN_PROJ}"
 echo "  Use std  projection: ${USE_STD_PROJ}"
 echo ""
@@ -515,7 +513,6 @@ def main():
         max_seeds=cfg.detection.max_seeds,
         smooth_sigma=cfg.detection.smooth_sigma,
         border_margin=cfg.detection.border_margin,
-        use_temporal_projection=cfg.detection.use_temporal_projection,
         use_mean_proj=cfg.detection.use_mean_proj,
         use_std_proj=cfg.detection.use_std_proj,
         n_peak_frames=cfg.detection.n_peak_frames,
@@ -678,10 +675,10 @@ def main():
         # Projections are invariant to radius choices, so the same set is used
         # by the auto-radius sweep, the final detection run, and the
         # visualization.  This replaces ~7 full projection computations with 1.
-        from contour_seed_detection import compute_projections_extended
+        from contour_seed_detection import compute_projections
 
         logger.info("Computing projections (single pass, shared downstream)...")
-        shared_projections = compute_projections_extended(
+        shared_projections = compute_projections(
             movie,
             compute_correlation=True,
             smooth_sigma=args.smooth_sigma,
@@ -702,9 +699,7 @@ def main():
                 args.min_radius = radius_result['best_min_radius']
                 args.max_radius = radius_result['best_max_radius']
                 logger.info(f"Auto-radius: using min={args.min_radius:.1f}, "
-                            f"max={args.max_radius:.1f} px "
-                            f"({radius_result['best_n_good']} neurons with "
-                            f"SNR≥{radius_result['snr_threshold']})")
+                            f"max={args.max_radius:.1f} px ")
             else:
                 logger.warning(f"Auto-radius: insufficient good traces — "
                                f"keeping defaults: "
@@ -730,7 +725,6 @@ def main():
         from contour_seed_detection import (
             detect_seeds_with_contours,
             contours_to_spatial_footprints,
-            visualize_contour_detection,
         )
 
         seeds = detect_seeds_with_contours(
@@ -741,11 +735,9 @@ def main():
             correlation_threshold=args.correlation_threshold,
             border_margin=args.border_margin,
             max_seeds=args.max_seeds,
-            contour_method='otsu',
             smooth_sigma=args.smooth_sigma,
             use_mean=args.use_mean_proj,
             use_std=args.use_std_proj,
-            use_temporal_projection=args.use_temporal_projection,
             n_peak_frames=args.n_peak_frames,
             peak_percentile=args.peak_percentile,
             diagnostics_dir=os.path.join(args.output, 'diagnostics'),
@@ -772,33 +764,13 @@ def main():
         projections = shared_projections
 
         # Unsmoothed projections for gallery background images (cheap — no correlation, no smoothing)
-        projections_raw = compute_projections_extended(movie, compute_correlation=False, smooth_sigma=0.0)
+        projections_raw = compute_projections(movie, compute_correlation=False, smooth_sigma=0.0)
         
         # Save clean projection arrays (unsmoothed max/std, smoothed correlation)
         np.save(os.path.join(args.output, 'max_projection_raw.npy'), projections_raw.max_proj)
         np.save(os.path.join(args.output, 'std_projection.npy'), projections_raw.std_proj)
         np.save(os.path.join(args.output, 'correlation_image.npy'), projections.correlation)
-        
-        # Original compact visualization
-        visualize_contour_detection(
-            projections, seeds,
-            os.path.join(args.output, 'seed_detection_v3.png')
-        )
-        
-        # Save individual projection figures to <output>/figures/
-        from contour_seed_detection import save_projection_figures
-        save_projection_figures(projections_raw, seeds, args.output, projections_corr=projections)
-        
-        # New detailed visualizations with zoom panels
-        from contour_seed_detection import visualize_contour_detection_detailed
-        visualize_contour_detection_detailed(
-            projections, seeds,
-            output_dir=os.path.join(args.output, 'detection_visualizations'),
-            movie=movie,
-            n_zoom_regions=6,
-            zoom_size=200,
-        )
-        
+                
         if seeds.n_seeds == 0:
             logger.error("No seeds detected!")
             return results
