@@ -236,14 +236,17 @@ echo "Python: \$(which python)"
 mkdir -p "\${OUTPUT_DIR}"
 
 # ── Run pipeline ──
-export MOVIE OUTPUT_DIR PIPELINE_DIR CONDA_ENV CONFIG_PATH
-
-bash "\${PIPELINE_DIR}/run_seeded_v3.sh"
+cd "\${PIPELINE_DIR}"
+python -m src.run_full_pipeline \\
+    --movie "\${MOVIE}" \\
+    --output "\${OUTPUT_DIR}" \\
+    --config "\${CONFIG_PATH}"
 EXIT_CODE=\$?
 
 echo ""
 if [ -f "\${OUTPUT_DIR}/spatial_footprints.npz" ]; then
-    echo "DONE: \${MOVIE}"
+    N_NEURONS=\$(python -c "from scipy.sparse import load_npz; print(load_npz('\${OUTPUT_DIR}/spatial_footprints.npz').shape[1])" 2>/dev/null || echo "?")
+    echo "DONE: \${MOVIE}  (\${N_NEURONS} neurons)"
 else
     echo "FAILED: \${MOVIE}"
 fi
@@ -369,15 +372,17 @@ echo "Python: $(which python)"
 mkdir -p "${FILE_OUTPUT}"
 
 # ── Run pipeline ──
-export MOVIE="${FILE}" OUTPUT_DIR="${FILE_OUTPUT}"
-export PIPELINE_DIR CONDA_ENV CONFIG_PATH
-
-bash "${PIPELINE_DIR}/run_seeded_v3.sh"
+cd "${PIPELINE_DIR}"
+python -m src.run_full_pipeline \
+    --movie "${FILE}" \
+    --output "${FILE_OUTPUT}" \
+    --config "${CONFIG_PATH}"
 EXIT_CODE=$?
 
 echo ""
 if [ -f "${FILE_OUTPUT}/spatial_footprints.npz" ]; then
-    echo "Task ${TASK_ID} DONE: ${FILESTEM}"
+    N_NEURONS=$(python -c "from scipy.sparse import load_npz; print(load_npz('${FILE_OUTPUT}/spatial_footprints.npz').shape[1])" 2>/dev/null || echo "?")
+    echo "Task ${TASK_ID} DONE: ${FILESTEM}  (${N_NEURONS} neurons)"
 else
     echo "Task ${TASK_ID} FAILED: ${FILESTEM}"
 fi

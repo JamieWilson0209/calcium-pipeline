@@ -171,6 +171,11 @@ class DetectionConfig:
     contour_fallback: bool = True    # Generate circular footprint when Otsu fails
     fallback_method: str = "gaussian"  # gaussian | disk (for contour_fallback)
 
+    # Contour-overlap merge (shape-aware fusion of overlapping contours)
+    contour_merge_min_overlap: float = 0.4   # |A∩B| / min(|A|,|B|)
+    contour_merge_iou: float = 0.2           # |A∩B| / |A∪B|
+    contour_merge_max_growth: float = 4.0    # Reject if hull > N× max member
+
     # Projection selection
     use_temporal_projection: bool = True
     n_peak_frames: int = 10
@@ -226,21 +231,21 @@ class DeconvolutionConfig:
 @dataclass
 class OutputConfig:
     """Output & visualisation options."""
-    gallery: bool = False                   # Interactive HTML gallery
-    movie_gallery: bool = False             # MP4 movie overlay viewer
+    # New (v3.7+) gallery flags — split per-ROI PNGs from the interactive HTML
+    per_roi_pngs: bool = False              # Per-ROI inspection PNGs (slow)
+    inspection_gallery: bool = True         # Interactive HTML gallery (fast)
+    # Legacy / env-var controlled
+    movie_gallery: bool = False             # Full movie + contour overlay HTML
     movie_gallery_subsample: int = 4        # Temporal subsampling factor
 
 
 @dataclass
 class QualityConfig:
     """Quality thresholds used by group analysis."""
-    confidence_threshold: float = 0.5
-    quality_threshold: float = 0.8
     drift_threshold: float = 1.0
     motion_max_threshold: float = 15.0
     motion_residual_threshold: float = 2.0
     min_roi_distance: float = 15.0          # px
-    n_select: int = 0                       # Fixed N neurons; 0 = use threshold
     inactive_file: Optional[str] = None
     # Genotype classification: maps line-prefix → genotype label.
     # Prefixes not listed fall through to 'default'.

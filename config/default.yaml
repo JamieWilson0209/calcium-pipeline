@@ -63,6 +63,19 @@ detection:
   contour_fallback: true      # generate circular footprint when Otsu fails
   fallback_method: gaussian   # gaussian | disk — shape of fallback footprint
 
+  # Contour-overlap merge (post-extraction). Fuses contours that overlap
+  # heavily — typically multiple sub-cellular detections inside one cell
+  # that grew into separate contours when auto-radius underestimated the
+  # true size. Two thresholds (either triggers a merge):
+  #   min_overlap = |A∩B| / min(|A|, |B|)  — catches small-inside-large
+  #   iou         = |A∩B| / |A∪B|          — catches symmetric mid-overlap
+  # max_growth guards against runaway component fusion: if the convex
+  # hull of a connected component is more than N× the largest member's
+  # area, the merge is rejected and members stay independent.
+  contour_merge_min_overlap: 0.4
+  contour_merge_iou: 0.2
+  contour_merge_max_growth: 4.0
+
   # Projection selection (which images to run blob detection on)
   use_temporal_projection: true
   n_peak_frames: 10
@@ -122,7 +135,18 @@ deconvolution:
 
 # ── Output & Visualisation ───────────────────────────────────────────────
 output:
-  gallery: false              # interactive HTML inspection gallery
+  # Per-ROI inspection PNGs: one PNG per ROI showing the peak-frame image
+  # sequence and its trace. Slow (one savefig per ROI) — off by default.
+  per_roi_pngs: false
+
+  # Interactive HTML inspection gallery (single self-contained file).
+  # Fast and useful for routine QC — on by default.
+  inspection_gallery: true
+
+  # Movie gallery — full movie + contour overlay viewer in a single HTML.
+  # File sizes can be large; subsampling reduces them.
+  movie_gallery: false
+  movie_gallery_subsample: 4    # 1 = every frame, 4 = every 4th, etc.
 
 
 # ── Quality Thresholds (Group Analysis) ──────────────────────────────────

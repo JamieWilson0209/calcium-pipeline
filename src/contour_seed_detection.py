@@ -433,6 +433,302 @@ def _merge_blob_detections(
 
 
 # =============================================================================
+# CONTOUR-LEVEL OVERLAP MERGE
+# =============================================================================
+#
+# The blob-level NMS above does only sub-pixel duplicate removal — it
+# compares centre points without knowing about contour shape. This stage
+# runs *after* contour extraction and fuses contours that overlap heavily
+# in mask space. It exists because auto-radius tends to underestimate
+# large neurons; the LoG detector then fires on multiple sub-cellular
+# hotspots inside a single cell, each growing into its own contour, and
+# those contours largely overlap.
+#
+# Decision rule (per pair):
+#     min-overlap = |A∩B| / min(|A|, |B|)
+#     IoU         = |A∩B| / |A∪B|
+#     edge if min-overlap ≥ τ_min  OR  IoU ≥ τ_iou
+#
+# Merge unit: connected components on the resulting graph, fused by
+# convex hull of the union. Components whose hull is more than
+# ``max_area_growth`` × the largest member's area trip the runaway guard
+# and are kept as independent singletons (better to under-merge than to
+# fuse two real cells via a chain).
+
+
+def _bboxes_intersect(b1, b2) -> bool:
+    """Cheap O(1) intersection test on (x, y, w, h) bboxes."""
+    x1, y1, w1, h1 = b1
+    x2, y2, w2, h2 = b2
+    return not (x1 + w1 < x2 or x2 + w2 < x1 or
+                y1 + h1 < y2 or y2 + h2 < y1)
+
+
+def _build_overlap_graph(
+    contours: List["ContourInfo"],
+    dims: Tuple[int, int],
+    min_overlap_threshold: float,
+    iou_threshold: float,
+) -> Tuple[List[List[int]], Dict[str, int]]:
+    """
+    Build adjacency list for contour-overlap graph.
+
+    Bounding-box pre-filter prunes most pairs without rasterising masks.
+    Masks are rasterised lazily on first use and cached for the duration
+    of this call.
+    """
+    n = len(contours)
+    adj: List[List[int]] = [[] for _ in range(n)]
+
+    bboxes = [c.bbox for c in contours]
+    areas = np.array([c.area for c in contours], dtype=np.float64)
+    masks_cache: Dict[int, np.ndarray] = {}
+
+    def get_mask(i: int) -> np.ndarray:
+        if i not in masks_cache:
+            masks_cache[i] = contours[i].to_mask(dims) > 0
+        return masks_cache[i]
+
+    n_mask_checks = 0
+    n_edges = 0
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not _bboxes_intersect(bboxes[i], bboxes[j]):
+                continue
+            n_mask_checks += 1
+            mi = get_mask(i)
+            mj = get_mask(j)
+            inter = int(np.logical_and(mi, mj).sum())
+            if inter == 0:
+                continue
+            min_a = min(areas[i], areas[j])
+            union = areas[i] + areas[j] - inter
+            min_overlap = inter / min_a if min_a > 0 else 0.0
+            iou = inter / union if union > 0 else 0.0
+            if min_overlap >= min_overlap_threshold or iou >= iou_threshold:
+                adj[i].append(j)
+                adj[j].append(i)
+                n_edges += 1
+
+    return adj, {
+        'n_pairs_total': n * (n - 1) // 2,
+        'n_bbox_pass': n_mask_checks,
+        'n_edges': n_edges,
+        'n_masks_rasterised': len(masks_cache),
+    }
+
+
+def _connected_components(adj: List[List[int]]) -> List[List[int]]:
+    """Return list of components (each a list of node indices) via BFS."""
+    n = len(adj)
+    seen = [False] * n
+    components: List[List[int]] = []
+    for start in range(n):
+        if seen[start]:
+            continue
+        stack = [start]
+        comp: List[int] = []
+        while stack:
+            u = stack.pop()
+            if seen[u]:
+                continue
+            seen[u] = True
+            comp.append(u)
+            for v in adj[u]:
+                if not seen[v]:
+                    stack.append(v)
+        components.append(comp)
+    return components
+
+
+def _convex_hull_contour_info(
+    members: List["ContourInfo"],
+    member_intensities: np.ndarray,
+    dims: Tuple[int, int],
+) -> "ContourInfo":
+    """
+    Build a ContourInfo from the convex hull of member contours.
+
+    Centre is the intensity-weighted average of member centres.
+    Mean intensity is the area-weighted average of member intensities
+    (cheap proxy — avoids re-reading the source image).
+    """
+    all_pts = np.vstack([c.contour for c in members])
+    hull_cnt = cv2.convexHull(all_pts)
+
+    area = cv2.contourArea(hull_cnt)
+    perimeter = cv2.arcLength(hull_cnt, True)
+    circularity = 4 * np.pi * area / perimeter ** 2 if perimeter > 0 else 0.0
+
+    component_area = sum(c.area for c in members)
+    solidity = component_area / area if area > 0 else 0.0
+
+    weights = member_intensities.astype(np.float64)
+    if weights.sum() <= 0:
+        weights = np.ones_like(weights)
+    cy = float(np.average([c.center[0] for c in members], weights=weights))
+    cx = float(np.average([c.center[1] for c in members], weights=weights))
+
+    bbox = cv2.boundingRect(hull_cnt)
+
+    member_areas = np.array([c.area for c in members], dtype=np.float64)
+    member_means = np.array([c.mean_intensity for c in members], dtype=np.float64)
+    if member_areas.sum() > 0:
+        mean_intensity = float(np.average(member_means, weights=member_areas))
+    else:
+        mean_intensity = float(np.mean(member_means))
+
+    return ContourInfo(
+        contour=hull_cnt,
+        center=(cy, cx),
+        area=area,
+        bbox=bbox,
+        circularity=circularity,
+        solidity=solidity,
+        mean_intensity=mean_intensity,
+    )
+
+
+def _merge_overlapping_contours(
+    contours: List[Optional["ContourInfo"]],
+    contour_success: List[bool],
+    intensities: np.ndarray,
+    dims: Tuple[int, int],
+    *,
+    min_overlap_threshold: float = 0.4,
+    iou_threshold: float = 0.2,
+    max_area_growth: float = 4.0,
+) -> Tuple[
+    List[Optional["ContourInfo"]],
+    List[bool],
+    np.ndarray,
+    List[List[int]],
+    Dict[str, Any],
+]:
+    """
+    Shape-aware merge of overlapping contours via convex hull of
+    connected components.
+
+    Successful contours that overlap above threshold are grouped and
+    fused into a single contour (convex hull of the union). Failed-
+    contour seeds pass through unchanged — they have no mask to compare.
+
+    Returns
+    -------
+    new_contours, new_success, new_intensities, kept_indices, diagnostics
+        ``kept_indices[i]`` lists the original-index members that map
+        into output index ``i``. Singletons report ``[orig_i]``; merged
+        groups report all members.
+    """
+    n = len(contours)
+    if n == 0:
+        return [], [], np.array([]), [], {
+            'merge_groups': 0, 'rejected_runaway': 0, 'singletons_passed': 0,
+            'n_input': 0, 'n_output': 0, 'n_input_success': 0,
+            'n_pairs_total': 0, 'n_bbox_pass': 0, 'n_edges': 0,
+            'n_masks_rasterised': 0,
+        }
+
+    # Successful-contour subset for graph construction
+    success_idx = [i for i, ok in enumerate(contour_success)
+                   if ok and contours[i] is not None]
+    success_contours = [contours[i] for i in success_idx]
+
+    if len(success_idx) < 2:
+        return (
+            list(contours), list(contour_success), intensities.copy(),
+            [[i] for i in range(n)],
+            {
+                'merge_groups': 0, 'rejected_runaway': 0,
+                'singletons_passed': n,
+                'n_input': n, 'n_output': n,
+                'n_input_success': len(success_idx),
+                'n_pairs_total': 0, 'n_bbox_pass': 0, 'n_edges': 0,
+                'n_masks_rasterised': 0,
+            },
+        )
+
+    adj, graph_diag = _build_overlap_graph(
+        success_contours, dims,
+        min_overlap_threshold=min_overlap_threshold,
+        iou_threshold=iou_threshold,
+    )
+    components = _connected_components(adj)
+
+    new_contours: List[Optional[ContourInfo]] = []
+    new_success: List[bool] = []
+    new_intensities: List[float] = []
+    kept_indices: List[List[int]] = []
+
+    rejected_runaway = 0
+    merged_groups = 0
+    success_handled: set = set()
+
+    for comp in components:
+        member_orig_indices = [success_idx[k] for k in comp]
+        success_handled.update(member_orig_indices)
+
+        if len(comp) == 1:
+            i = member_orig_indices[0]
+            new_contours.append(contours[i])
+            new_success.append(True)
+            new_intensities.append(float(intensities[i]))
+            kept_indices.append([i])
+            continue
+
+        members = [contours[i] for i in member_orig_indices]
+        member_ints = intensities[member_orig_indices]
+        max_member_area = max(m.area for m in members)
+
+        merged_ci = _convex_hull_contour_info(members, member_ints, dims)
+
+        if merged_ci.area > max_area_growth * max_member_area:
+            # Runaway: keep all members independent
+            rejected_runaway += 1
+            for i in member_orig_indices:
+                new_contours.append(contours[i])
+                new_success.append(True)
+                new_intensities.append(float(intensities[i]))
+                kept_indices.append([i])
+        else:
+            merged_groups += 1
+            new_contours.append(merged_ci)
+            new_success.append(True)
+            new_intensities.append(float(np.max(member_ints)))
+            kept_indices.append(member_orig_indices)
+
+    # Pass through failed-contour seeds
+    singletons_passed = 0
+    for i in range(n):
+        if i in success_handled:
+            continue
+        new_contours.append(contours[i])
+        new_success.append(bool(contour_success[i]))
+        new_intensities.append(float(intensities[i]))
+        kept_indices.append([i])
+        singletons_passed += 1
+
+    diag = {
+        'merge_groups': merged_groups,
+        'rejected_runaway': rejected_runaway,
+        'singletons_passed': singletons_passed,
+        'n_input': n,
+        'n_output': len(new_contours),
+        'n_input_success': len(success_idx),
+        **graph_diag,
+    }
+
+    return (
+        new_contours,
+        new_success,
+        np.array(new_intensities, dtype=np.float64),
+        kept_indices,
+        diag,
+    )
+
+
+# =============================================================================
 # CONTOUR EXTRACTION
 # =============================================================================
 
@@ -737,6 +1033,9 @@ def detect_seeds_with_contours(
     smooth_sigma: float = 0.0,
     n_peak_frames: int = 10,
     peak_percentile: float = 90.0,
+    contour_merge_min_overlap: float = 0.4,
+    contour_merge_iou: float = 0.2,
+    contour_merge_max_growth: float = 4.0,
     diagnostics_dir: Optional[str] = None,
     precomputed_projections: Optional[ProjectionSet] = None,
 ) -> ContourSeedResult:
@@ -769,6 +1068,17 @@ def detect_seeds_with_contours(
         Number of peak-activity frames per blob for local projection.
     peak_percentile : float
         Percentile threshold for selecting peak-activity frames.
+    contour_merge_min_overlap : float
+        Min-overlap-fraction threshold for contour merge — fraction of
+        the *smaller* contour contained in the larger. Default 0.4.
+        Catches the "small hotspot inside a larger cell" case.
+    contour_merge_iou : float
+        IoU threshold for contour merge. Default 0.2. Catches the
+        symmetric mid-overlap case.
+    contour_merge_max_growth : float
+        Reject merges whose convex hull is more than this multiple of
+        the largest member's area. Default 4.0. Guards against chains
+        of barely-overlapping contours fusing into a runaway region.
     diagnostics_dir : str, optional
         If given, writes JSON diagnostics here.
     precomputed_projections : ProjectionSet, optional
@@ -877,8 +1187,12 @@ def detect_seeds_with_contours(
         blob_lists.append(blobs_std)
         master_diag['blob_detection']['std'] = diag_std
 
+    # Tight NMS: only collapse near-duplicate detections from the same
+    # hotspot (sub-pixel offsets, multi-projection hits on identical
+    # points). Anatomical fusion of multiple blobs inside one cell is
+    # handled later at the contour level via _merge_overlapping_contours.
     merged_blobs, merge_diag = _merge_blob_detections(
-        blob_lists, min_distance=min_radius * 1.5
+        blob_lists, min_distance=min_radius * 0.5
     )
     master_diag['blob_detection']['merge'] = merge_diag
     master_diag['timing']['blob_detection'] = time.time() - t_step
@@ -944,22 +1258,87 @@ def detect_seeds_with_contours(
     )
 
     # =========================================================================
+    # STEP 3.5: Shape-aware contour merge
+    # =========================================================================
+    # Fuse contours that overlap heavily in mask space — typically multiple
+    # sub-cellular detections inside one cell that grew into separate
+    # contours. See _merge_overlapping_contours for the decision rule.
+    logger.info("\n--- STEP 3.5: Contour overlap merge ---")
+    t_step = time.time()
+
+    blob_intensities = np.array([b.intensity for b in merged_blobs])
+    blob_sources     = np.array([b.source for b in merged_blobs])
+    blob_centers     = np.array([b.center for b in merged_blobs])
+    blob_radii       = np.array([b.radius for b in merged_blobs])
+
+    (
+        contours,
+        contour_success,
+        intensities,
+        kept_indices,
+        contour_merge_diag,
+    ) = _merge_overlapping_contours(
+        contours,
+        contour_success,
+        blob_intensities,
+        dims=(d1, d2),
+        min_overlap_threshold=contour_merge_min_overlap,
+        iou_threshold=contour_merge_iou,
+        max_area_growth=contour_merge_max_growth,
+    )
+    contour_success_arr = np.array(contour_success)
+    master_diag['contour_merge'] = contour_merge_diag
+    master_diag['timing']['contour_merge'] = time.time() - t_step
+
+    logger.info(
+        f"  Merged contours: {contour_merge_diag['n_input']} → "
+        f"{contour_merge_diag['n_output']} "
+        f"({contour_merge_diag['merge_groups']} groups merged, "
+        f"{contour_merge_diag['rejected_runaway']} rejected as runaway)"
+    )
+
+    # Build per-output centres / radii / sources from the merged groups.
+    # For multi-member groups the representative source is taken from the
+    # highest-intensity member; centre and radius come from the merged
+    # contour itself (or fall back to the original blob centre on failures).
+    n_out = len(contours)
+    centers = np.zeros((n_out, 2), dtype=np.float64)
+    radii = np.zeros(n_out, dtype=np.float64)
+    sources = np.empty(n_out, dtype=object)
+
+    for i, members in enumerate(kept_indices):
+        ci = contours[i]
+        if ci is not None and contour_success[i]:
+            centers[i] = ci.center
+            radii[i] = np.sqrt(ci.area / np.pi)
+        else:
+            # failed-contour seed: use original blob geometry
+            j = members[0]
+            centers[i] = blob_centers[j]
+            radii[i] = blob_radii[j]
+
+        # Representative source: highest-intensity member's projection
+        member_ints = blob_intensities[members]
+        sources[i] = blob_sources[members[int(np.argmax(member_ints))]]
+
+    sources = sources.astype('U10')
+
+    # Remap per-blob diagnostics across the merge. Each merged output
+    # inherits the highest-intensity member's diagnostics record.
+    remapped_diagnostics: List[Dict] = []
+    for members in kept_indices:
+        member_ints = blob_intensities[members]
+        rep = members[int(np.argmax(member_ints))]
+        remapped_diagnostics.append(per_blob_diagnostics[rep])
+    per_blob_diagnostics = remapped_diagnostics
+
+    # =========================================================================
     # STEP 4: Build output arrays
     # =========================================================================
     logger.info("\n--- STEP 4: Output ---")
 
-    centers     = np.array([b.center    for b in merged_blobs])
-    radii       = np.array([b.radius    for b in merged_blobs])
-    intensities = np.array([b.intensity for b in merged_blobs])
-    sources     = np.array([b.source    for b in merged_blobs])
-
-    for i, (ci, ok) in enumerate(zip(contours, contour_success)):
-        if ok and ci is not None:
-            centers[i] = ci.center
-            radii[i] = np.sqrt(ci.area / np.pi)
-
     # ── Boundary-touching exclusion ──────────────────────────────────────────
-    boundary_touching = np.zeros(len(merged_blobs), dtype=bool)
+    boundary_touching = np.zeros(n_out, dtype=bool)
     for i, (ci, ok) in enumerate(zip(contours, contour_success)):
         if ok and ci is not None:
             pts = ci.contour.squeeze()
