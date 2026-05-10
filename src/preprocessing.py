@@ -6,7 +6,7 @@ Converts raw fluorescence traces to ΔF/F₀ using a rolling low-percentile
 baseline.  Two methods are provided:
 
 - **global_dff** (default): per-trace rolling 8th-percentile baseline.
-  Standard approach used by Suite2p and CaImAn.
+  Same family of approach as Suite2p and CaImAn's ``detrend_df_f``.
 
 - **local_background**: tissue-masked annulus around each ROI provides a
   local F₀(t).  Designed for organoid data where bright tissue is
@@ -158,8 +158,9 @@ def compute_dff_traces(
     """
     Convert raw fluorescence traces to ΔF/F₀ using per-trace rolling baseline.
 
-    Standard approach (Suite2p, CaImAn): a rolling low-percentile filter
-    estimates F₀(t) for each trace, then ΔF/F₀ = (F − F₀) / F₀.
+    A rolling low-percentile filter estimates F₀(t) for each trace, then
+    ΔF/F₀ = (F − F₀) / F₀.  Same family as Suite2p and CaImAn's
+    ``detrend_df_f``.
 
     Parameters
     ----------
@@ -214,6 +215,9 @@ def compute_dff_traces(
         if baseline[0] > 0:
             drift_pcts[i] = 100.0 * (baseline[0] - baseline[-1]) / baseline[0]
 
+        # n_clipped counts samples flagged as extreme (|dff|>50);
+        # the clip below is more aggressive (cap at 100, floor -1) so
+        # the output stays well-conditioned for downstream stats.
         n_extreme = int(np.sum(np.abs(dff) > 50.0))
         n_clipped += n_extreme
         C_dff[i] = np.clip(dff, -1.0, 100.0).astype(np.float32)
@@ -397,6 +401,9 @@ def compute_dff_local_background(
         if F0_local[i, 0] > 0:
             drift_pcts[i] = 100.0 * (F0_local[i, 0] - F0_local[i, -1]) / F0_local[i, 0]
 
+        # n_clipped counts samples flagged as extreme (|dff|>50);
+        # the clip below is more aggressive (cap at 100, floor -1) so
+        # the output stays well-conditioned for downstream stats.
         n_extreme = int(np.sum(np.abs(dff) > 50.0))
         n_clipped += n_extreme
         C_dff[i] = np.clip(dff, -1.0, 100.0).astype(np.float32)
@@ -417,287 +424,3 @@ def compute_dff_local_background(
         **stats,
     }
     return C_dff, C_raw, info
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DIAGNOSTIC FIGURES
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_dff_diagnostics(
-    C_raw_fluorescence: np.ndarray,
-    C_dff: np.ndarray,
-    dff_info: dict,
-    output_dir: str,
-    method: str = 'global_dff',
-    frame_rate: float = 2.0,
-    movie: np.ndarray = None,
-    A=None,
-    n_example_traces: int = 8,
-):
-    """
-    Generate diagnostic figures for ΔF/F₀ baseline correction.
-
-    Produces:
-    1. dff_overview.png — Summary statistics panel
-    2. dff_example_traces.png — Example traces showing raw + ΔF/F₀
-    3. dff_local_background.png — (local_background only) Tissue mask + annulus
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import os
-
-    os.makedirs(output_dir, exist_ok=True)
-    N, T = C_dff.shape
-    t_axis = np.arange(T) / frame_rate
-
-    METHOD_LABELS = {
-        'global_dff': 'Global Per-Trace ΔF/F₀',
-        'local_dff': 'Local Per-Event ΔF/F₀',
-        'local_background': 'Local Tissue-Masked Background',
-    }
-    method_label = METHOD_LABELS.get(method, method)
-
-    # ── Figure 1: Overview statistics ────────────────────────────────────
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f'ΔF/F₀ Baseline Correction — {method_label}',
-                 fontsize=14, fontweight='bold')
-
-    # 1a: Raw trace medians
-    ax = axes[0, 0]
-    raw_medians = np.median(C_raw_fluorescence, axis=1)
-    ax.hist(raw_medians, bins=50, color='#4472C4', alpha=0.7, edgecolor='white')
-    ax.set_xlabel('Median raw fluorescence')
-    ax.set_ylabel('Count')
-    ax.set_title('Raw Trace Medians')
-    ax.axvline(np.median(raw_medians), color='red', linestyle='--',
-               label=f'median={np.median(raw_medians):.0f}')
-    ax.legend(fontsize=8)
-
-    # 1b: ΔF/F₀ medians
-    ax = axes[0, 1]
-    dff_medians = np.median(C_dff, axis=1)
-    ax.hist(dff_medians, bins=50, color='#ED7D31', alpha=0.7, edgecolor='white')
-    ax.set_xlabel('Median ΔF/F₀')
-    ax.set_ylabel('Count')
-    ax.set_title('ΔF/F₀ Trace Medians')
-    ax.axvline(np.median(dff_medians), color='red', linestyle='--',
-               label=f'median={np.median(dff_medians):.4f}')
-    ax.axvline(0, color='black', linestyle='-', alpha=0.3)
-    ax.legend(fontsize=8)
-
-    # 1c: Residual drift
-    ax = axes[0, 2]
-    chunk = max(1, T // 10)
-    drifts = np.mean(C_dff[:, -chunk:], axis=1) - np.mean(C_dff[:, :chunk], axis=1)
-    ax.hist(drifts, bins=50, color='#70AD47', alpha=0.7, edgecolor='white')
-    ax.set_xlabel('Residual drift (last 10% − first 10%)')
-    ax.set_ylabel('Count')
-    ax.set_title('Residual Drift After Correction')
-    ax.axvline(0, color='black', linestyle='-', alpha=0.3)
-    ax.axvline(np.median(drifts), color='red', linestyle='--',
-               label=f'median={np.median(drifts):.4f}')
-    ax.legend(fontsize=8)
-
-    # 1d: Amplitude distribution
-    ax = axes[1, 0]
-    amplitudes = np.percentile(C_dff, 95, axis=1) - np.percentile(C_dff, 5, axis=1)
-    ax.hist(amplitudes, bins=50, color='#A855F7', alpha=0.7, edgecolor='white')
-    ax.set_xlabel('ΔF/F₀ amplitude (p95 − p5)')
-    ax.set_ylabel('Count')
-    ax.set_title('Trace Amplitude Distribution')
-    ax.axvline(np.median(amplitudes), color='red', linestyle='--',
-               label=f'median={np.median(amplitudes):.4f}')
-    ax.legend(fontsize=8)
-
-    # 1e: Raw vs corrected drift
-    ax = axes[1, 1]
-    raw_drifts = (np.mean(C_raw_fluorescence[:, -chunk:], axis=1)
-                  - np.mean(C_raw_fluorescence[:, :chunk], axis=1))
-    raw_drifts_pct = raw_drifts / np.maximum(np.median(C_raw_fluorescence, axis=1), 1.0) * 100
-    ax.scatter(raw_drifts_pct, drifts, s=8, alpha=0.4, c='#4472C4')
-    ax.set_xlabel('Raw drift (% of median)')
-    ax.set_ylabel('Corrected drift (ΔF/F₀)')
-    ax.set_title('Drift Correction Effectiveness')
-    ax.axhline(0, color='black', linestyle='-', alpha=0.3)
-    ax.axvline(0, color='black', linestyle='-', alpha=0.3)
-
-    # 1f: Info text
-    ax = axes[1, 2]
-    ax.axis('off')
-    info_lines = [
-        f"Method: {method_label}",
-        f"N traces: {N}",
-        f"T frames: {T}  ({T/frame_rate:.1f}s)",
-        f"",
-        f"Median baseline drift: {dff_info.get('median_baseline_drift_pct', 'N/A')}%",
-        f"Median ΔF/F₀: {dff_info.get('median_dff', 'N/A'):.4f}",
-        f"Window: {dff_info.get('window_frames', 'N/A')} frames",
-        f"Clipped: {dff_info.get('n_clipped', 0)}",
-        f"",
-        f"Residual drift:",
-        f"  median: {dff_info.get('residual_drift_median', 'N/A')}",
-        f"  p10: {dff_info.get('residual_drift_p10', 'N/A')}",
-        f"  p90: {dff_info.get('residual_drift_p90', 'N/A')}",
-    ]
-    if method == 'local_background':
-        info_lines += [
-            f"",
-            f"Tissue fraction: {dff_info.get('tissue_fraction', 'N/A'):.1%}",
-            f"Median annulus: {dff_info.get('median_annulus_pixels', 'N/A'):.0f} px",
-            f"Global fallback: {dff_info.get('n_fallback_global', 0)} ROIs",
-        ]
-    ax.text(0.05, 0.95, '\n'.join(info_lines), transform=ax.transAxes,
-            fontsize=9, verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='#f0f0f0', alpha=0.8))
-
-    plt.tight_layout()
-    path = os.path.join(output_dir, 'dff_overview.png')
-    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    logger.info(f"  Saved: {path}")
-
-    # ── Figure 2: Example traces ─────────────────────────────────────────
-    amp_order = np.argsort(amplitudes)
-    n_ex = min(n_example_traces, N)
-    indices = amp_order[np.linspace(0, N - 1, n_ex, dtype=int)]
-
-    fig, axes = plt.subplots(n_ex, 1, figsize=(16, 2.5 * n_ex), sharex=True)
-    if n_ex == 1:
-        axes = [axes]
-    fig.suptitle(f'Example Traces — {method_label}',
-                 fontsize=13, fontweight='bold')
-
-    for row, idx in enumerate(indices):
-        ax = axes[row]
-        raw = C_raw_fluorescence[idx]
-        dff = C_dff[idx]
-
-        color_raw = '#4472C4'
-        color_dff = '#ED7D31'
-        ax.plot(t_axis, raw, color=color_raw, alpha=0.6, linewidth=0.5)
-        ax.set_ylabel(f'ROI {idx}\nRaw F', fontsize=8, color=color_raw)
-        ax.tick_params(axis='y', labelcolor=color_raw, labelsize=7)
-
-        ax2 = ax.twinx()
-        ax2.plot(t_axis, dff, color=color_dff, alpha=0.8, linewidth=0.7)
-        ax2.set_ylabel('ΔF/F₀', fontsize=8, color=color_dff)
-        ax2.tick_params(axis='y', labelcolor=color_dff, labelsize=7)
-        ax2.axhline(0, color='gray', linestyle=':', alpha=0.4)
-
-        amp_val = amplitudes[idx]
-        drift_val = drifts[idx]
-        ax.set_title(f'ROI {idx}  |  amplitude={amp_val:.4f}  |  drift={drift_val:.4f}',
-                     fontsize=8, loc='left')
-
-    axes[-1].set_xlabel('Time (s)')
-    plt.tight_layout()
-    path = os.path.join(output_dir, 'dff_example_traces.png')
-    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    logger.info(f"  Saved: {path}")
-
-    # ── Figure 3: Local background diagnostics ───────────────────────────
-    if method == 'local_background' and movie is not None and A is not None:
-        _generate_local_background_diagnostic(
-            movie, A, C_raw_fluorescence, C_dff, dff_info,
-            output_dir, frame_rate)
-
-
-def _generate_local_background_diagnostic(
-    movie, A, C_raw, C_dff, dff_info, output_dir, frame_rate,
-):
-    """Tissue mask + annulus diagnostic figure for local background method."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from scipy.ndimage import binary_dilation
-    from scipy.sparse import issparse
-    import os
-
-    T, d1, d2 = movie.shape
-    dims = (d1, d2)
-
-    A_dense = (A.toarray().astype(np.float32) if issparse(A)
-               else np.asarray(A, dtype=np.float32))
-    N = A_dense.shape[1]
-
-    mean_proj = np.mean(movie[:min(100, T)], axis=0)
-    try:
-        from skimage.filters import threshold_otsu
-        thresh = threshold_otsu(mean_proj[mean_proj > 0])
-    except Exception:
-        thresh = np.percentile(mean_proj, 25)
-    tissue_mask = mean_proj > thresh
-
-    # Select 6 example ROIs spread across the FOV
-    centers = []
-    for i in range(N):
-        fp = A_dense[:, i].reshape(dims)
-        ys, xs = np.where(fp > 0)
-        if len(ys) > 0:
-            centers.append((i, np.mean(ys), np.mean(xs)))
-    centers.sort(key=lambda c: c[1] * 1000 + c[2])
-    n_examples = min(6, len(centers))
-    example_idx = [centers[i][0] for i in
-                   np.linspace(0, len(centers) - 1, n_examples, dtype=int)]
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('Local Background Diagnostics — Tissue Mask & Annulus',
-                 fontsize=13, fontweight='bold')
-
-    # Full FOV with tissue mask
-    ax = axes[0, 0]
-    ax.imshow(mean_proj, cmap='gray',
-              vmin=np.percentile(mean_proj, 1),
-              vmax=np.percentile(mean_proj, 99))
-    mask_overlay = np.zeros((*dims, 4))
-    mask_overlay[tissue_mask] = [0, 1, 0, 0.15]
-    mask_overlay[~tissue_mask] = [1, 0, 0, 0.1]
-    ax.imshow(mask_overlay)
-    ax.set_title(f'Tissue Mask ({tissue_mask.sum()/tissue_mask.size:.0%} tissue)',
-                 fontsize=10)
-    ax.set_xticks([]); ax.set_yticks([])
-
-    # Zoom panels for example ROIs
-    for panel_idx, roi_idx in enumerate(example_idx[:5]):
-        row = (panel_idx + 1) // 3
-        col = (panel_idx + 1) % 3
-        ax = axes[row, col]
-
-        fp = A_dense[:, roi_idx].reshape(dims)
-        roi_mask = fp > 0
-        ys, xs = np.where(roi_mask)
-        cy, cx = int(np.mean(ys)), int(np.mean(xs))
-
-        margin = 40
-        y0, y1 = max(0, cy - margin), min(d1, cy + margin)
-        x0, x1 = max(0, cx - margin), min(d2, cx + margin)
-
-        inner = binary_dilation(roi_mask, iterations=2)
-        outer = binary_dilation(roi_mask, iterations=22)
-        annulus = outer & ~inner & tissue_mask
-
-        crop = mean_proj[y0:y1, x0:x1]
-        ax.imshow(crop, cmap='gray',
-                  vmin=np.percentile(mean_proj, 1),
-                  vmax=np.percentile(mean_proj, 99))
-
-        overlay = np.zeros((y1 - y0, x1 - x0, 4))
-        overlay[roi_mask[y0:y1, x0:x1]] = [0, 0.5, 1, 0.4]
-        overlay[annulus[y0:y1, x0:x1]] = [0, 1, 0, 0.25]
-        overlay[~tissue_mask[y0:y1, x0:x1]] = [1, 0, 0, 0.1]
-        ax.imshow(overlay)
-
-        n_ann = int(annulus.sum())
-        amp = float(np.percentile(C_dff[roi_idx], 95)
-                    - np.percentile(C_dff[roi_idx], 5))
-        ax.set_title(f'ROI {roi_idx}  |  annulus={n_ann}px  |  amp={amp:.3f}',
-                     fontsize=8)
-        ax.set_xticks([]); ax.set_yticks([])
-
-    plt.tight_layout()
-    path = os.path.join(output_dir, 'dff_local_background.png')
-    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    logger.info(f"  Saved: {path}")

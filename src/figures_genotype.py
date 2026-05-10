@@ -1215,8 +1215,10 @@ def run_genotype_comparison(datasets: List[DatasetMetrics], output_dir: str,
             flags.append(f"corr={o['pairwise_corr']:.3f}")
         logger.info(f"      {o['recording']} ({o['genotype']}): {', '.join(flags)}")
 
-    # Write outlier report to file
-    outlier_report_path = os.path.join(geno_dir, 'outlier_report.txt')
+    # Write outlier report to file (data, not figures)
+    outlier_report_dir = os.path.join(output_dir, 'data')
+    os.makedirs(outlier_report_dir, exist_ok=True)
+    outlier_report_path = os.path.join(outlier_report_dir, 'outlier_report.txt')
     with open(outlier_report_path, 'w') as f_out:
         f_out.write("Outlier Detection Report: Active Fraction vs Pairwise Correlation\n")
         f_out.write("=" * 70 + "\n\n")
@@ -3164,11 +3166,11 @@ def generate_roi_peak_figures(datasets: List, output_dir: str) -> None:
         result_path = Path(ds.filepath)
 
         # ── Load required arrays ──────────────────────────────────────────
-        denoised_path  = result_path / 'traces_denoised.npy'
-        raw_path       = result_path / 'temporal_traces.npy'
-        spikes_path    = result_path / 'spike_trains.npy'
-        noise_path     = result_path / 'deconv_noise.npy'
-        footprint_path = result_path / 'spatial_footprints.npz'
+        denoised_path  = result_path / 'data' / 'traces_denoised.npy'
+        raw_path       = result_path / 'data' / 'temporal_traces.npy'
+        spikes_path    = result_path / 'data' / 'spike_trains.npy'
+        noise_path     = result_path / 'data' / 'deconv_noise.npy'
+        footprint_path = result_path / 'data' / 'spatial_footprints.npz'
         info_path      = result_path / 'run_info.json'
 
         if not denoised_path.exists() or not spikes_path.exists():
@@ -3226,7 +3228,7 @@ def generate_roi_peak_figures(datasets: List, output_dir: str) -> None:
                 if not dims_ok:
                     # 1. Try max_projection / mean_projection saved alongside results
                     for proj_name in ('max_projection.npy', 'mean_projection.npy'):
-                        proj_p = result_path / proj_name
+                        proj_p = result_path / 'data' / proj_name
                         if proj_p.exists():
                             try:
                                 mp = np.load(proj_p)

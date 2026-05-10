@@ -1,1125 +1,851 @@
 """
-Diagnostics & Confidence Scoring
-=================================
+Diagnostic Figures
+==================
 
-Post-detection diagnostic analysis and normalised confidence scoring.
+Single home for every diagnostic / inspection figure produced by the
+pipeline.  Each function is a pure side-effect that takes already-computed
+results and writes one or more PNGs to disk.
 
-This module provides two things:
+This module does **not** compute any pipeline quantities.  It consumes:
 
-1. **Temporal diagnostics** — transient count, activity fraction, baseline
-   drift, and indicator-aware decay validation. These are the quality
-   signals that the detection stage does not compute.
+- result dataclasses / dicts returned by other stages
+- already-extracted traces, footprints, and movies
 
-2. **Confidence scoring** — combines signals from two independent sources
-   (detection quality and temporal diagnostics) into a single normalised
-   0–1 score per neuron.
+…and produces matplotlib figures.
 
-Nothing in this module filters or drops neurons. Confidence scores are
-informational — the interactive gallery exposes a slider so the user
-decides the threshold.
+Sections
+--------
+- Motion correction   :func:`generate_motion_figure`
+- Auto-radius sweep   :func:`generate_radius_figure`
+- ΔF/F₀ baseline      :func:`generate_local_background_diagnostic`
+- Deconvolution       :func:`generate_deconvolution_figure`,
+                      :func:`save_roi_trace_figures`,
+                      :func:`generate_decay_diagnostics`
+- Per-ROI inspection  :func:`generate_per_roi_pngs`
+
+Each callable below is invoked once from ``run_full_pipeline.py`` at the
+appropriate stage; nothing in this module is called recursively from
+within other ``src/`` modules (with one exception: the local-background
+helper is a private continuation of the ΔF/F₀ entry point).
 """
 
-import numpy as np
-from scipy.signal import find_peaks
+import os
 import logging
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# RESULT CONTAINER
+# MOTION CORRECTION
 # =============================================================================
 
-@dataclass
-class DiagnosticResult:
-    """
-    Container for all diagnostic outputs.
-
-    Attributes
-    ----------
-    confidence : ndarray, shape (N,)
-        Combined normalised confidence score (0–1).
-    transient_count : ndarray, shape (N,)
-        Number of detected calcium transients per component.
-    activity_fraction : ndarray, shape (N,)
-        Fraction of frames each component is active (0–1).
-    baseline_drift : ndarray, shape (N,)
-        Baseline instability as fraction of signal range (0 = stable).
-    dynamics_validity : ndarray, shape (N,)
-        Fraction of transients with indicator-consistent decay (0–1).
-    detection_confidence : ndarray or None
-        Seed-level confidence from contour detection stage.
-    confidence_source : str
-        Weighting scheme used (always ``"detection_temporal"``).
-    """
-    confidence: np.ndarray
-    transient_count: np.ndarray
-    activity_fraction: np.ndarray
-    baseline_drift: np.ndarray
-    dynamics_validity: np.ndarray
-    detection_confidence: Optional[np.ndarray] = None
-    confidence_source: str = "detection_temporal"
-
-    @property
-    def n_components(self) -> int:
-        return len(self.confidence)
-
-    def get_summary(self) -> Dict[str, object]:
-        """Summary statistics for logging and reporting."""
-        n = self.n_components
-        if n == 0:
-            return {'n_components': 0}
-
-        def _stats(arr):
-            valid = arr[np.isfinite(arr)]
-            if len(valid) == 0:
-                return {}
-            return {
-                'median': float(np.median(valid)),
-                'mean': float(np.mean(valid)),
-                'p10': float(np.percentile(valid, 10)),
-                'p90': float(np.percentile(valid, 90)),
-            }
-
-        summary = {
-            'n_components': n,
-            'confidence': _stats(self.confidence),
-            'transient_count': _stats(self.transient_count),
-            'activity_fraction': _stats(self.activity_fraction),
-            'baseline_drift': _stats(self.baseline_drift),
-            'dynamics_validity': _stats(self.dynamics_validity),
-            'confidence_source': self.confidence_source,
-        }
-        return summary
-
-    def to_npz_dict(self) -> Dict[str, np.ndarray]:
-        """Flat dict suitable for ``np.savez``."""
-        d = {
-            'confidence': self.confidence,
-            'transient_count': self.transient_count,
-            'activity_fraction': self.activity_fraction,
-            'baseline_drift': self.baseline_drift,
-            'dynamics_validity': self.dynamics_validity,
-        }
-        if self.detection_confidence is not None:
-            d['detection_confidence'] = self.detection_confidence
-        return d
-
-
-# =============================================================================
-# TEMPORAL DIAGNOSTICS
-# =============================================================================
-
-def _estimate_noise(trace: np.ndarray) -> float:
-    """
-    Robust noise estimate using MAD of temporal differences.
-
-    The first-order temporal difference (frame-to-frame change) removes
-    slow drift, bleach residuals, and low-frequency neuropil contamination.
-    The MAD of these differences, scaled by 1/sqrt(2), gives a noise
-    floor estimate that is robust to both slow artifacts AND calcium
-    transients (which are sparse in the difference domain).
-
-    This is a standard approach also used by CaImAn, Suite2p, and other pipelines.
-    """
-    T = len(trace)
-    if T < 4:
-        return max(np.std(trace), 1e-10)
-
-    diff = np.diff(trace)
-    mad = np.median(np.abs(diff - np.median(diff)))
-    # MAD → σ conversion (1.4826) and diff → original scaling (1/√2)
-    noise = 1.4826 * mad / np.sqrt(2)
-    return max(noise, 1e-10)
-
-
-def _detect_calcium_events(
-    trace: np.ndarray,
-    frame_rate: float,
-    decay_time: float = 1.0,
-    min_snr: float = 5.0,
-    min_prominence_snr: float = 3.5,
-) -> np.ndarray:
-    """
-    Detect genuine calcium transient events in a single trace.
-
-    Designed for non-deconvolved traces from the weighted-average trace
-    extraction path. Uses the MAD-of-differences noise estimator (robust to
-    slow drift and neuropil) with conservative peak thresholds.
-
-    A valid event must:
-
-    1. Exceed ``min_snr`` × noise above the 20th-percentile baseline
-       (default 5.0 — handles structured noise in raw traces)
-    2. Have prominence ≥ ``min_prominence_snr`` × noise (default 3.5 —
-       rejects shoulders on larger events)
-    3. Be separated from the previous event by at least
-       ``2 × decay_time`` seconds (indicator refractory period)
-
-    No additional shape-based filtering (rise/decay checks) is applied,
-    as these are unreliable at low frame rates (≤10 Hz) where transient
-    dynamics span only 2-4 frames.
+def generate_motion_figure(result, output_path: str) -> str:
+    """Save motion correction diagnostic figure.
 
     Parameters
     ----------
-    trace : 1D array
-    frame_rate : float
-    decay_time : float
-    min_snr : float
-        Minimum peak height in noise units (default 5.0).
-    min_prominence_snr : float
-        Minimum prominence in noise units (default 3.5).
-
-    Returns
-    -------
-    peaks : 1D int array — indices of detected events
-    """
-    baseline = np.percentile(trace, 20)
-    noise = _estimate_noise(trace)
-    normed = (trace - baseline) / noise
-
-    # Refractory: 2× decay ensures previous transient has decayed to ~14%
-    refractory_frames = max(int(2.0 * decay_time * frame_rate), 3)
-
-    try:
-        peaks, props = find_peaks(
-            normed,
-            height=min_snr,
-            distance=refractory_frames,
-            prominence=min_prominence_snr,
-        )
-    except Exception:
-        return np.array([], dtype=int)
-
-    return peaks
-
-
-def compute_transient_count(
-    C: np.ndarray,
-    frame_rate: float,
-    min_snr: float = 5.0,
-    decay_time: float = 1.0,
-) -> np.ndarray:
-    """
-    Count calcium transients per component.
-
-    Uses ``_detect_calcium_events`` with conservative thresholds
-    (min_snr=5.0, prominence=3.5) to avoid counting noise as events.
-    Critical for the weighted-average trace extraction path where traces contain
-    structured noise from neuropil and bleach correction residuals.
-
-    Parameters
-    ----------
-    C : array, shape (N, T)
-    frame_rate : float
-    min_snr : float
-        Minimum peak height in noise units (default 5.0).
-    decay_time : float
-        Expected indicator decay time in seconds (default 1.0).
-
-    Returns
-    -------
-    array, shape (N,), dtype int
-    """
-    n = C.shape[0]
-    counts = np.zeros(n, dtype=int)
-
-    for i in range(n):
-        peaks = _detect_calcium_events(
-            C[i, :], frame_rate, decay_time=decay_time, min_snr=min_snr,
-        )
-        counts[i] = len(peaks)
-
-    return counts
-
-
-def compute_activity_fraction(
-    C: np.ndarray,
-    threshold_sigma: float = 3.0,
-) -> np.ndarray:
-    """
-    Fraction of frames each component is above baseline + threshold.
-
-    Uses the PSD-based noise estimator. Threshold of 3.0σ (raised
-    from 2.0) to reduce false activity from structured noise.
-
-    Parameters
-    ----------
-    C : array, shape (N, T)
-    threshold_sigma : float
-        Activation threshold in noise units (default 3.0).
-
-    Returns
-    -------
-    array, shape (N,), in [0, 1]
-    """
-    n, T = C.shape
-    frac = np.zeros(n)
-
-    for i in range(n):
-        trace = C[i, :]
-        baseline = np.percentile(trace, 20)
-        noise = _estimate_noise(trace)
-        frac[i] = (trace > baseline + threshold_sigma * noise).sum() / T
-
-    return frac
-
-
-def compute_baseline_drift(
-    C: np.ndarray,
-    window_size: int = 100,
-) -> np.ndarray:
-    """
-    Baseline instability as fraction of signal range (0 = stable).
-
-    Parameters
-    ----------
-    C : array, shape (N, T)
-    window_size : int
-
-    Returns
-    -------
-    array, shape (N,)
-    """
-    n, T = C.shape
-    drift = np.zeros(n)
-
-    if T < window_size * 2:
-        return drift
-
-    n_win = T // window_size
-
-    for i in range(n):
-        trace = C[i, :]
-        sig_range = trace.max() - trace.min()
-        if sig_range < 1e-10:
-            continue
-
-        baselines = [
-            np.percentile(trace[w * window_size:(w + 1) * window_size], 20)
-            for w in range(n_win)
-        ]
-        drift[i] = (max(baselines) - min(baselines)) / sig_range
-
-    return drift
-
-
-def compute_dynamics_validity(
-    C: np.ndarray,
-    frame_rate: float,
-    decay_time: float,
-    tolerance: float = 2.0,
-) -> np.ndarray:
-    """
-    Fraction of transients with indicator-consistent decay dynamics.
-
-    For each peak, measures time to decay to 37 % (1/e) and checks
-    whether it falls within ``[decay_time / tolerance, decay_time × tolerance]``.
-
-    Parameters
-    ----------
-    C : array, shape (N, T)
-    frame_rate : float
-    decay_time : float
-        Expected 1/e decay time in seconds.
-    tolerance : float
-        Multiplicative band (default 2.0 → 0.5× to 2×).
-
-    Returns
-    -------
-    array, shape (N,), in [0, 1]
-    """
-    n, T = C.shape
-    validity = np.zeros(n)
-
-    min_frames = int(decay_time / tolerance * frame_rate)
-    max_frames = int(decay_time * tolerance * frame_rate)
-
-    for i in range(n):
-        trace = C[i, :]
-        baseline = np.percentile(trace, 20)
-        normed = trace - baseline
-        noise = _estimate_noise(trace)
-
-        peaks = _detect_calcium_events(
-            trace, frame_rate, decay_time=decay_time, min_snr=3.5,
-        )
-
-        if len(peaks) == 0:
-            validity[i] = 0.5
-            continue
-
-        n_valid = 0.0
-        for pk in peaks:
-            target = normed[pk] * 0.37
-            decay_idx = None
-            for j in range(pk + 1, min(pk + max_frames + 10, T)):
-                if normed[j] <= target:
-                    decay_idx = j
-                    break
-
-            if decay_idx is not None:
-                df = decay_idx - pk
-                if min_frames <= df <= max_frames:
-                    n_valid += 1.0
-            else:
-                n_valid += 0.5  # slow decay — partial credit
-
-        validity[i] = n_valid / len(peaks)
-
-    return validity
-
-
-def compute_temporal_diagnostics(
-    C: np.ndarray,
-    frame_rate: float,
-    decay_time: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Compute all four temporal diagnostic arrays.
-
-    Parameters
-    ----------
-    C : array, shape (N, T)
-    frame_rate : float
-    decay_time : float
-        Expected indicator decay time in seconds.
-
-    Returns
-    -------
-    transient_count : array (N,)
-    activity_fraction : array (N,)
-    baseline_drift : array (N,)
-    dynamics_validity : array (N,)
-    """
-    tc = compute_transient_count(C, frame_rate, decay_time=decay_time)
-    af = compute_activity_fraction(C)
-    bd = compute_baseline_drift(C, window_size=max(int(frame_rate * 10), 20))
-    dv = compute_dynamics_validity(C, frame_rate, decay_time)
-    return tc, af, bd, dv
-
-
-# =============================================================================
-# CONFIDENCE SCORING
-# =============================================================================
-
-def _temporal_score(
-    transient_count: np.ndarray,
-    activity_fraction: np.ndarray,
-    baseline_drift: np.ndarray,
-    dynamics_validity: np.ndarray,
-) -> np.ndarray:
-    """Combine temporal diagnostics into a single 0–1 score."""
-    has_activity = np.clip(transient_count / 5.0, 0.0, 1.0)
-
-    activity_ok = np.where(
-        (activity_fraction >= 0.01) & (activity_fraction <= 0.6),
-        1.0, 0.5,
-    )
-
-    baseline_ok = np.clip(1.0 - baseline_drift / 0.3, 0.0, 1.0)
-
-    return (
-        0.35 * has_activity
-        + 0.15 * activity_ok
-        + 0.20 * baseline_ok
-        + 0.30 * dynamics_validity
-    )
-
-
-def compute_confidence(
-    n_components: int,
-    *,
-    detection_confidence: Optional[np.ndarray] = None,
-    transient_count: Optional[np.ndarray] = None,
-    activity_fraction: Optional[np.ndarray] = None,
-    baseline_drift: Optional[np.ndarray] = None,
-    dynamics_validity: Optional[np.ndarray] = None,
-    boundary_touching: Optional[np.ndarray] = None,
-    contour_success: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, str]:
-    """
-    Combine all available quality signals into a normalised 0–1 confidence.
-
-    Weights: 0.45 detection + 0.55 temporal.
-
-    Parameters
-    ----------
-    n_components : int
-        Number of neurons.
-    detection_confidence : array (N,), optional
-        Seed-level confidence from contour extraction (0–1).
-    transient_count, activity_fraction, baseline_drift, dynamics_validity
-        Temporal diagnostics (from ``compute_temporal_diagnostics``).
-    boundary_touching : bool array (N,), optional
-        Whether each neuron's contour touches the FOV edge.
-    contour_success : bool array (N,), optional
-        Whether contour extraction succeeded for each seed.
-
-    Returns
-    -------
-    confidence : array (N,), in [0, 1]
-    source : str
-        ``"detection_temporal"``
-    """
-    if n_components == 0:
-        return np.array([]), "detection_temporal"
-
-    # --- Detection score ---
-    if detection_confidence is not None:
-        det_score = np.asarray(detection_confidence, dtype=np.float64)
-    else:
-        det_score = np.full(n_components, 0.5)
-
-    # --- Temporal score ---
-    if transient_count is not None:
-        temp_score = _temporal_score(
-            transient_count, activity_fraction,
-            baseline_drift, dynamics_validity,
-        )
-    else:
-        temp_score = np.full(n_components, 0.5)
-
-    # --- Combine ---
-    confidence = (
-        0.45 * det_score
-        + 0.55 * temp_score
-    )
-    source = "detection_temporal"
-
-    # --- Penalties ---
-    if boundary_touching is not None:
-        confidence = np.where(boundary_touching, confidence - 0.10, confidence)
-    if contour_success is not None:
-        confidence = np.where(~contour_success, confidence - 0.05, confidence)
-
-    confidence = np.clip(confidence, 0.0, 1.0)
-    return confidence, source
-
-
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
-
-def run_diagnostics(
-    C: np.ndarray,
-    frame_rate: float,
-    decay_time: float,
-    *,
-    detection_confidence: Optional[np.ndarray] = None,
-    boundary_touching: Optional[np.ndarray] = None,
-    contour_success: Optional[np.ndarray] = None,
-    verbose: bool = True,
-) -> DiagnosticResult:
-    """
-    Run full diagnostic analysis and confidence scoring.
-
-    This is the primary entry point. Call after trace extraction
-    with whatever signals are available.
-
-    Parameters
-    ----------
-    C : array, shape (N, T)
-        Temporal traces.
-    frame_rate : float
-        Acquisition rate in Hz.
-    decay_time : float
-        Expected indicator decay time in seconds.
-    detection_confidence : array (N,), optional
-        From ``ContourSeedResult.confidence``.
-    boundary_touching : bool array (N,), optional
-    contour_success : bool array (N,), optional
-    verbose : bool
-
-    Returns
-    -------
-    DiagnosticResult
-    """
-    n = C.shape[0] if C is not None and C.ndim == 2 else 0
-
-    if n == 0:
-        empty = np.array([])
-        return DiagnosticResult(
-            confidence=empty, transient_count=empty,
-            activity_fraction=empty, baseline_drift=empty,
-            dynamics_validity=empty,
-        )
-
-    if verbose:
-        logger.info(f"Running diagnostics for {n} components "
-                    f"(decay_time={decay_time}s, frame_rate={frame_rate} Hz)")
-
-    tc, af, bd, dv = compute_temporal_diagnostics(C, frame_rate, decay_time)
-
-    confidence, source = compute_confidence(
-        n,
-        detection_confidence=detection_confidence,
-        transient_count=tc,
-        activity_fraction=af,
-        baseline_drift=bd,
-        dynamics_validity=dv,
-        boundary_touching=boundary_touching,
-        contour_success=contour_success,
-    )
-
-    result = DiagnosticResult(
-        confidence=confidence,
-        transient_count=tc,
-        activity_fraction=af,
-        baseline_drift=bd,
-        dynamics_validity=dv,
-        detection_confidence=detection_confidence,
-        confidence_source=source,
-    )
-
-    if verbose:
-        s = result.get_summary()
-        c = s.get('confidence', {})
-        logger.info(
-            f"  Confidence ({source}): "
-            f"median={c.get('median', 0):.2f}, "
-            f"p10={c.get('p10', 0):.2f}, "
-            f"p90={c.get('p90', 0):.2f}"
-        )
-        t = s.get('transient_count', {})
-        logger.info(
-            f"  Transients: median={t.get('median', 0):.0f}, "
-            f"dynamics validity: median={s.get('dynamics_validity', {}).get('median', 0):.2f}"
-        )
-
-    return result
-
-
-# =============================================================================
-# FIGURE GENERATION
-# =============================================================================
-
-def generate_diagnostic_figures(
-    result: DiagnosticResult,
-    output_dir: str,
-    *,
-    A=None,
-    dims: Optional[tuple] = None,
-    C: Optional[np.ndarray] = None,
-    frame_rate: Optional[float] = None,
-    decay_time: float = 1.0,
-    max_projection: Optional[np.ndarray] = None,
-    fmt: str = "png",
-    dpi: int = 150,
-) -> List[str]:
-    """
-    Generate diagnostic summary figures.
-
-    Produces up to three figures:
-
-    1. **neuron_quality_summary.{fmt}** — adaptive layout depending on
-       whether detection metrics are available. Shows confidence distribution,
-       temporal diagnostics, and quality breakdown.
-
-    2. **quality_detail.{fmt}** — baseline stability, event dynamics,
-       confidence breakdown, and ranked confidence curve.
-
-    3. **spatial_activity_map.{fmt}** — (if A and dims provided) spatial
-       map showing neuron locations colour-coded by event frequency, with
-       an optional temporal activity raster.
-
-    Parameters
-    ----------
-    result : DiagnosticResult
-    output_dir : str
-    A : sparse matrix, optional
-        Spatial footprints (n_pixels, N) for spatial map.
-    dims : (H, W), optional
-        Image dimensions for spatial map.
-    C : array (N, T), optional
-        Temporal traces for activity raster.
-    frame_rate : float, optional
-        Frame rate for time axis labelling.
-    fmt, dpi : str, int
+    result : MotionCorrectionResult
+        From :mod:`motion_correction`.
+    output_path : str
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from matplotlib.gridspec import GridSpec
-    import os
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+
+    # 1. Shifts over time
+    ax = axes[0, 0]
+    ax.plot(result.shifts[:, 0], label='Y shift', alpha=0.7)
+    ax.plot(result.shifts[:, 1], label='X shift', alpha=0.7)
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Shift (px)')
+    ax.set_title(f'Motion Shifts ({result.mode})')
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # 2. Shift magnitude
+    ax = axes[0, 1]
+    magnitude = np.sqrt(result.shifts[:, 0]**2 + result.shifts[:, 1]**2)
+    ax.plot(magnitude, color='steelblue', alpha=0.7)
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Magnitude (px)')
+    ax.set_title(f'Shift Magnitude (max={magnitude.max():.1f} px)')
+    ax.grid(alpha=0.3)
+
+    # 3. Template
+    ax = axes[1, 0]
+    ax.imshow(result.template, cmap='gray')
+    ax.set_title('Reference Template')
+    ax.axis('off')
+
+    # 4. Correlations
+    ax = axes[1, 1]
+    ax.plot(result.correlations[:min(len(result.correlations), 500)],
+            color='steelblue', alpha=0.7)
+    ax.set_xlabel('Frame')
+    ax.set_ylabel('Correlation')
+    ax.set_title('Frame-Template Correlation')
+    ax.grid(alpha=0.3)
+
+    fig.suptitle(f'Motion Correction — {result.mode}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return output_path
+
+
+# =============================================================================
+# AUTO-RADIUS SWEEP
+# =============================================================================
+
+def generate_radius_figure(radius_result: dict, output_path: str) -> str:
+    """
+    Save a 2-panel diagnostic figure for the radius optimisation sweep.
+
+    Panel A — median Otsu inter-class variance per candidate (scoring metric)
+    Panel B — variance distributions per candidate (CDF)
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    results  = radius_result['all_results']
+    best_idx = next(
+        i for i, r in enumerate(results)
+        if r['min_radius'] == radius_result['best_min_radius']
+        and r['max_radius'] == radius_result['best_max_radius']
+    )
+
+    x      = np.arange(len(results))
+    labels = [f"[{r['min_radius']:.0f},{r['max_radius']:.0f}]" for r in results]
+
+    BEST_COLOUR = '#e94560'
+    BASE_COLOUR = 'steelblue'
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, panel in zip(axes, ['A', 'B']):
+        ax.text(-0.1, 1.05, panel, transform=ax.transAxes,
+                fontsize=24, fontweight='bold', va='top', ha='right')
+
+    # Panel A: Median inter-class variance per candidate
+    ax = axes[0]
+    colours = [BEST_COLOUR if i == best_idx else BASE_COLOUR
+               for i in range(len(results))]
+    ax.bar(x, [r['median_variance'] for r in results],
+           color=colours, edgecolor='black', alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, fontsize=11)
+    ax.set_xlabel('Radius range [min, max] (px)')
+    ax.set_ylabel('Median Otsu inter-class variance', fontsize=12)
+    ax.set_title('Otsu Separation by Radius', fontsize=14)
+
+    # Panel B: Variance CDFs
+    ax = axes[1]
+    for i, res in enumerate(results):
+        variances = res['variances']
+        if not variances:
+            continue
+        sorted_v = np.sort(variances)
+        cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
+        ax.plot(sorted_v, cdf,
+                color=BEST_COLOUR if i == best_idx else BASE_COLOUR,
+                alpha=0.9 if i == best_idx else 0.4,
+                linewidth=2 if i == best_idx else 1,
+                label=labels[i])
+    ax.set_xlabel('Otsu inter-class variance', fontsize=12)
+    ax.set_ylabel('Cumulative fraction', fontsize=12)
+    ax.set_title('Variance Distributions', fontsize=14)
+    ax.set_xlim(left=0)
+    ax.legend(fontsize=10, loc='lower right')
+
+    best = results[best_idx]
+    fig.suptitle(
+        f"Auto-Radius — Best: [{best['min_radius']:.0f}, {best['max_radius']:.0f}] px  "
+        f"median variance={best['median_variance']:.1f}  "
+        f"n_contours={best['n_contours']}",
+        fontsize=13, fontweight='bold',
+    )
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return output_path
+
+
+# =============================================================================
+# ΔF/F₀ BASELINE CORRECTION (local-background method only)
+# =============================================================================
+# The local-background ΔF/F method depends on a per-ROI annulus falling on
+# tissue but not on neighbouring ROIs.  This figure visualises the tissue
+# mask and several example annuli so the geometry can be sanity-checked.
+
+def generate_local_background_diagnostic(
+    movie, A, C_raw, C_dff, dff_info, output_dir, frame_rate,
+):
+    """Tissue mask + annulus diagnostic figure for local background method."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import binary_dilation
+    from scipy.sparse import issparse
+
+    T, d1, d2 = movie.shape
+    dims = (d1, d2)
+
+    A_dense = (A.toarray().astype(np.float32) if issparse(A)
+               else np.asarray(A, dtype=np.float32))
+    N = A_dense.shape[1]
+
+    mean_proj = np.mean(movie[:min(100, T)], axis=0)
+    try:
+        from skimage.filters import threshold_otsu
+        thresh = threshold_otsu(mean_proj[mean_proj > 0])
+    except Exception:
+        thresh = np.percentile(mean_proj, 25)
+    tissue_mask = mean_proj > thresh
+
+    # Select 6 example ROIs spread across the FOV
+    centers = []
+    for i in range(N):
+        fp = A_dense[:, i].reshape(dims)
+        ys, xs = np.where(fp > 0)
+        if len(ys) > 0:
+            centers.append((i, np.mean(ys), np.mean(xs)))
+    centers.sort(key=lambda c: c[1] * 1000 + c[2])
+    n_examples = min(6, len(centers))
+    example_idx = [centers[i][0] for i in
+                   np.linspace(0, len(centers) - 1, n_examples, dtype=int)]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Local Background Diagnostics — Tissue Mask & Annulus',
+                 fontsize=13, fontweight='bold')
+
+    # Full FOV with tissue mask
+    ax = axes[0, 0]
+    ax.imshow(mean_proj, cmap='gray',
+              vmin=np.percentile(mean_proj, 1),
+              vmax=np.percentile(mean_proj, 99))
+    mask_overlay = np.zeros((*dims, 4))
+    mask_overlay[tissue_mask] = [0, 1, 0, 0.15]
+    mask_overlay[~tissue_mask] = [1, 0, 0, 0.1]
+    ax.imshow(mask_overlay)
+    ax.set_title(f'Tissue Mask ({tissue_mask.sum()/tissue_mask.size:.0%} tissue)',
+                 fontsize=10)
+    ax.set_xticks([]); ax.set_yticks([])
+
+    # Zoom panels for example ROIs
+    for panel_idx, roi_idx in enumerate(example_idx[:5]):
+        row = (panel_idx + 1) // 3
+        col = (panel_idx + 1) % 3
+        ax = axes[row, col]
+
+        fp = A_dense[:, roi_idx].reshape(dims)
+        roi_mask = fp > 0
+        ys, xs = np.where(roi_mask)
+        cy, cx = int(np.mean(ys)), int(np.mean(xs))
+
+        margin = 40
+        y0, y1 = max(0, cy - margin), min(d1, cy + margin)
+        x0, x1 = max(0, cx - margin), min(d2, cx + margin)
+
+        inner = binary_dilation(roi_mask, iterations=2)
+        outer = binary_dilation(roi_mask, iterations=22)
+        annulus = outer & ~inner & tissue_mask
+
+        crop = mean_proj[y0:y1, x0:x1]
+        ax.imshow(crop, cmap='gray',
+                  vmin=np.percentile(mean_proj, 1),
+                  vmax=np.percentile(mean_proj, 99))
+
+        overlay = np.zeros((y1 - y0, x1 - x0, 4))
+        overlay[roi_mask[y0:y1, x0:x1]] = [0, 0.5, 1, 0.4]
+        overlay[annulus[y0:y1, x0:x1]] = [0, 1, 0, 0.25]
+        overlay[~tissue_mask[y0:y1, x0:x1]] = [1, 0, 0, 0.1]
+        ax.imshow(overlay)
+
+        n_ann = int(annulus.sum())
+        amp = float(np.percentile(C_dff[roi_idx], 95)
+                    - np.percentile(C_dff[roi_idx], 5))
+        ax.set_title(f'ROI {roi_idx}  |  annulus={n_ann}px  |  amp={amp:.3f}',
+                     fontsize=8)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, 'dff_local_background.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    logger.info(f"  Saved: {path}")
+
+
+# =============================================================================
+# DECONVOLUTION
+# =============================================================================
+# All three deconvolution figures share the MAD-of-differences noise
+# estimator from :mod:`deconvolution`.  Importing it here keeps the noise
+# definition single-sourced.
+
+from deconvolution import _mad_noise as _deconv_mad_noise  # noqa: E402
+
+
+def save_roi_trace_figures(
+    C: np.ndarray,
+    deconv_result: dict,
+    frame_rate: float,
+    output_dir: str,
+    n_rois: int = 20,
+    dpi: int = 150,
+) -> str:
+    """
+    Save one presentation-quality figure per ROI showing the raw ΔF/F₀
+    trace (top panel) and the OASIS deconvolved trace with spike markers
+    (bottom panel).
+
+    ROIs are selected automatically: the top ``n_rois`` by SNR among those
+    with at least one detected spike, so every saved figure is informative.
+
+    Parameters
+    ----------
+    C : array (N, T)
+        ΔF/F₀ traces passed into deconvolution (or raw fluorescence — the
+        function uses ``deconv_result['C_dff']`` if available, falling back
+        to C).
+    deconv_result : dict
+        Output of ``deconvolve_traces``.
+    frame_rate : float
+        Sampling rate in Hz — used to label the time axis.
+    output_dir : str
+        Parent output directory.  Figures are written to
+        ``<output_dir>/figures/roi_traces/``.
+    n_rois : int
+        Number of ROIs to save (default 20).
+    dpi : int
+        Figure resolution (default 150).
+
+    Returns
+    -------
+    str  Path to the roi_traces directory.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    S      = deconv_result['S']
+    C_den  = deconv_result['C_denoised']
+    n_spikes = deconv_result['n_spikes']
+    C_raw  = deconv_result.get('C_dff', C)   # prefer the ΔF/F₀ that OASIS saw
+
+    N, T = C_raw.shape
+    t_ax = np.arange(T) / frame_rate
+
+    # ── Select ROIs: top n_rois by SNR among those with spikes ──────────
+    snr = np.zeros(N)
+    for i in range(N):
+        noise = _deconv_mad_noise(C_raw[i])
+        if noise > 0:
+            snr[i] = (np.percentile(C_raw[i], 95) - np.percentile(C_raw[i], 5)) / noise
+
+    active_idx = np.where(n_spikes > 0)[0]
+    if len(active_idx) == 0:
+        logger.warning("  No ROIs with detected spikes — skipping ROI trace figures")
+        return output_dir
+
+    selected = active_idx[np.argsort(snr[active_idx])[::-1]][:n_rois]
+
+    traces_dir = os.path.join(output_dir, 'figures', 'roi_traces')
+    os.makedirs(traces_dir, exist_ok=True)
+
+    for rank, roi_idx in enumerate(selected):
+        raw   = C_raw[roi_idx]
+        den   = C_den[roi_idx]
+        spike_frames = np.where(S[roi_idx] > 0)[0]
+
+        fig, (ax_raw, ax_den) = plt.subplots(
+            2, 1, figsize=(14, 4),
+            sharex=True,
+            gridspec_kw={'hspace': 0.08},
+        )
+
+        # ── Top: raw ΔF/F₀ ───────────────────────────────────────────
+        ax_raw.plot(t_ax, raw, color='#aaaaaa', linewidth=0.8, zorder=2)
+        ax_raw.set_ylabel('ΔF/F₀', fontsize=10)
+        ax_raw.set_xlim(t_ax[0], t_ax[-1])
+        ax_raw.spines[['top', 'right']].set_visible(False)
+        ax_raw.tick_params(axis='x', labelbottom=False)
+
+        # ── Bottom: deconvolved trace + spike markers ────────────────
+        ax_den.plot(t_ax, den, color='#2196F3', linewidth=1.2, zorder=2,
+                    label='Deconvolved')
+        if len(spike_frames) > 0:
+            spike_times = spike_frames / frame_rate
+            ax_den.vlines(spike_times,
+                          ymin=0, ymax=den[spike_frames],
+                          color='#F44336', linewidth=1.2,
+                          zorder=3, label='Spikes')
+            ax_den.scatter(spike_times, den[spike_frames],
+                           color='#F44336', s=18, zorder=4)
+
+        ax_den.axhline(0, color='#555555', linewidth=0.5, linestyle='--')
+        ax_den.set_ylabel('Deconvolved', fontsize=10)
+        ax_den.set_xlabel('Time (s)', fontsize=10)
+        ax_den.set_xlim(t_ax[0], t_ax[-1])
+        ax_den.spines[['top', 'right']].set_visible(False)
+
+        fig.suptitle(
+            f'ROI {roi_idx}   |   SNR {snr[roi_idx]:.1f}   |   '
+            f'{n_spikes[roi_idx]} spikes   |   s_min = 0.1 ΔF/F₀',
+            fontsize=11, fontweight='bold', y=1.01,
+        )
+
+        fname = os.path.join(traces_dir, f'roi_{roi_idx:04d}_rank{rank+1:03d}.png')
+        fig.savefig(fname, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+
+    logger.info(f"  Saved {len(selected)} ROI trace figures → {traces_dir}/")
+    return traces_dir
+
+
+def generate_deconvolution_figure(
+    C: np.ndarray,
+    deconv_result: dict,
+    frame_rate: float,
+    output_path: str,
+    n_examples: int = 8,
+    C_filtered=None,
+) -> str:
+    """Generate diagnostic figure showing deconvolution results."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    S = deconv_result['S']
+    C_den = deconv_result['C_denoised']
+    n_spikes = deconv_result['n_spikes']
+
+    # Use the ΔF/F₀ version for display if available
+    C_plot = deconv_result.get('C_dff', C)
+
+    N, T = C_plot.shape
+    t_ax = np.arange(T) / frame_rate
+
+    # Pick examples: prioritise neurons WITH detected spikes, sorted by SNR.
+    # Show a mix of active neurons (to verify detection quality) and
+    # at most 2 inactive ones (to verify they're correctly silent).
+    snr = np.zeros(N)
+    for i in range(N):
+        noise = _deconv_mad_noise(C_plot[i])
+        if noise > 0:
+            snr[i] = (np.percentile(C_plot[i], 95) - np.percentile(C_plot[i], 5)) / noise
+
+    has_spikes = n_spikes > 0
+    active_idx = np.where(has_spikes)[0]
+    inactive_idx = np.where(~has_spikes)[0]
+
+    # Sort each group by SNR descending
+    active_sorted = active_idx[np.argsort(snr[active_idx])[::-1]] if len(active_idx) > 0 else np.array([], dtype=int)
+    inactive_sorted = inactive_idx[np.argsort(snr[inactive_idx])[::-1]] if len(inactive_idx) > 0 else np.array([], dtype=int)
+
+    # Take up to (n_examples - 2) active, then fill with up to 2 inactive
+    n_active_show = min(len(active_sorted), max(n_examples - 2, n_examples))
+    n_inactive_show = min(len(inactive_sorted), max(0, n_examples - n_active_show))
+    examples = np.concatenate([active_sorted[:n_active_show], inactive_sorted[:n_inactive_show]]).astype(int)
+    examples = examples[:n_examples]
+
+    fig, axes = plt.subplots(n_examples, 1, figsize=(16, n_examples * 2.2),
+                             sharex=True)
+    if n_examples == 1:
+        axes = [axes]
+
+    for ax, idx in zip(axes, examples):
+        # Raw ΔF/F₀ trace
+        ax.plot(t_ax, C_plot[idx], color='#888', alpha=0.4, linewidth=0.5,
+                label='ΔF/F₀')
+
+        # Denoised trace
+        ax.plot(t_ax, C_den[idx], color='#00e676', linewidth=1.2,
+                label='Denoised')
+
+        # Spike times
+        spike_frames = np.where(S[idx] > 0)[0]
+        if len(spike_frames) > 0:
+            spike_times = spike_frames / frame_rate
+            ax.scatter(spike_times, C_den[idx, spike_frames],
+                       color='red', s=15, zorder=5, label='Spikes')
+
+        ax.set_ylabel(f'ROI {idx}', fontsize=8)
+        ax.grid(alpha=0.2)
+        ax.tick_params(labelsize=7)
+
+        info = f'SNR={snr[idx]:.1f}, {n_spikes[idx]} spikes'
+        ax.text(0.99, 0.95, info, transform=ax.transAxes, fontsize=7,
+                ha='right', va='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+    axes[0].legend(fontsize=8, ncol=4, loc='upper left')
+    axes[-1].set_xlabel('Time (s)')
+
+    method = deconv_result['method']
+    total = int(n_spikes.sum())
+    median = float(np.median(n_spikes))
+    fig.suptitle(f'Deconvolution ({method}) — {total} total spikes, '
+                 f'median {median:.0f}/neuron',
+                 fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    return output_path
+
+
+def generate_decay_diagnostics(
+    deconv_result: dict,
+    C_dff: np.ndarray,
+    frame_rate: float,
+    decay_time_initial: float,
+    output_dir: str,
+):
+    """
+    Generate diagnostic figure for deconvolution decay parameters.
+
+    Produces decay_diagnostics.png with 6 panels:
+      A — Histogram of fitted g values vs initial g
+      B — Histogram of implied tau values vs initial tau
+      C — Per-ROI scatter of fitted tau vs trace SNR
+      D–F — Example transient overlays (fastest / median / slowest decay)
+
+    Parameters
+    ----------
+    deconv_result : dict
+        Output from deconvolve_traces()
+    C_dff : np.ndarray (N, T)
+        Input ΔF/F₀ traces
+    frame_rate, decay_time_initial : float
+    output_dir : str
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
 
     os.makedirs(output_dir, exist_ok=True)
-    paths = []
-    n = result.n_components
 
-    if n == 0:
-        logger.warning("No components — skipping diagnostic figures")
-        return paths
+    N, T = C_dff.shape
+    dt = 1.0 / frame_rate
+    g_init = np.exp(-dt / decay_time_initial)
 
-    # ── Colour palette ────────────────────────────────────────────────
-    C_BLUE   = '#3b82f6'
-    C_GREEN  = '#10b981'
-    C_AMBER  = '#f59e0b'
-    C_RED    = '#ef4444'
-    C_GREY   = '#94a3b8'
-    C_LGREY  = '#f1f5f9'
+    g_fitted = deconv_result['g'][:, 0]
+    g_valid = g_fitted[g_fitted > 0]
 
-    def _style(ax, title, xlabel=None, ylabel=None):
-        ax.set_title(title, fontsize=11, fontweight='600', pad=8)
-        if xlabel:
-            ax.set_xlabel(xlabel, fontsize=9, color='#475569')
-        if ylabel:
-            ax.set_ylabel(ylabel, fontsize=9, color='#475569')
-        ax.tick_params(labelsize=8, colors='#64748b')
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        ax.spines['left'].set_color('#cbd5e1')
-        ax.spines['bottom'].set_color('#cbd5e1')
+    if len(g_valid) == 0:
+        logger.warning("No valid g values — skipping decay diagnostics")
+        return None
 
-    def _annotate_median(ax, values, color='#1e293b'):
-        med = np.median(values)
-        ax.axvline(med, color=color, linestyle='--', linewidth=1.2, alpha=0.8)
-        ax.text(med, ax.get_ylim()[1] * 0.92, f'median {med:.2f}',
-                ha='center', fontsize=7.5, color=color,
-                bbox=dict(boxstyle='round,pad=0.2', fc='white', ec='none', alpha=0.8))
+    tau_fitted = -dt / np.log(np.clip(g_valid, 1e-10, 1 - 1e-10))
+    tau_all = -dt / np.log(np.clip(g_fitted, 1e-10, 1 - 1e-10))
+    tau_cap = np.percentile(tau_fitted, 99)
 
-    # ── Figure 1: Neuron Quality Summary ─────────────────────────────
+    C_den = deconv_result['C_denoised']
+    S = deconv_result['S']
+    noise = deconv_result['noise']
 
-    fig1 = plt.figure(figsize=(15, 8.5))
-    gs = GridSpec(2, 3, figure=fig1, width_ratios=[1, 1, 1])
-    axes = np.empty((2, 3), dtype=object)
-    # Top row: confidence (wide), detection confidence
-    axes[0, 0] = fig1.add_subplot(gs[0, 0:2])  # wide confidence
-    axes[0, 1] = None  # placeholder
-    axes[0, 2] = fig1.add_subplot(gs[0, 2])
-    axes[1, 0] = fig1.add_subplot(gs[1, 0])
-    axes[1, 1] = fig1.add_subplot(gs[1, 1])
-    axes[1, 2] = fig1.add_subplot(gs[1, 2])
+    # SNR per ROI
+    snr = np.zeros(N)
+    for i in range(N):
+        n = noise[i]
+        if n > 1e-10:
+            snr[i] = (np.percentile(C_dff[i], 95) - np.percentile(C_dff[i], 5)) / n
 
-    scoring_label = 'Detection + Temporal'
-    fig1.suptitle(
-        f'Neuron Quality Summary — {n} neurons\n'
-        f'Scoring: {scoring_label}',
-        fontsize=13, fontweight='700', y=0.98, color='#1e293b',
-    )
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    fig.suptitle('Deconvolution decay parameter diagnostics', fontsize=20,
+                 fontweight='bold')
 
-    # 1a. Confidence distribution
+    # ── A: g histogram ───────────────────────────────────────────────────
     ax = axes[0, 0]
-    ax.hist(result.confidence, bins=30, range=(0, 1), color=C_BLUE,
-            alpha=0.85, edgecolor='white', linewidth=0.5)
-    _annotate_median(ax, result.confidence)
-    q25, q75 = np.percentile(result.confidence, [25, 75])
-    ax.axvspan(q25, q75, alpha=0.08, color=C_BLUE)
-    ax.text(0.97, 0.92, f'IQR: {q25:.2f}–{q75:.2f}',
-            transform=ax.transAxes, ha='right', fontsize=8, color=C_GREY)
-    _style(ax, 'Overall Confidence Score', 'confidence (0–1)', 'number of neurons')
+    ax.hist(g_valid, bins=50, color='#4472C4', alpha=0.7, edgecolor='white')
+    ax.axvline(g_init, color='red', linestyle='--', linewidth=2,
+               label=f'Initial g = {g_init:.4f}\n(τ = {decay_time_initial}s)')
+    ax.axvline(np.median(g_valid), color='orange', linewidth=2,
+               label=f'Median fitted = {np.median(g_valid):.4f}')
+    ax.set_xlabel('Fitted g (AR1 coefficient)', fontsize=18)
+    ax.set_ylabel('Count', fontsize=18)
+    ax.set_title('A — Fitted decay coefficient', fontsize=24, fontweight='bold')
+    ax.legend(fontsize=18, loc='upper right')
+    ax.tick_params(labelsize=18)
 
-    # 1b. Detection confidence if available
+    # ── B: tau histogram ─────────────────────────────────────────────────
+    ax = axes[0, 1]
+    tau_clip = np.clip(tau_fitted, 0, tau_cap)
+    ax.hist(tau_clip, bins=50, color='#ED7D31', alpha=0.7, edgecolor='white')
+    ax.axvline(decay_time_initial, color='red', linestyle='--', linewidth=2,
+               label=f'Initial τ = {decay_time_initial}s')
+    ax.axvline(np.median(tau_fitted), color='blue', linewidth=2,
+               label=f'Median fitted = {np.median(tau_fitted):.2f}s')
+    ax.set_xlabel('Implied decay time τ (seconds)', fontsize=18)
+    ax.set_ylabel('Count', fontsize=18)
+    ax.set_title('B — Implied decay time', fontsize=24, fontweight='bold')
+    ax.legend(fontsize=18, loc='upper right')
+    ax.tick_params(labelsize=18)
+
+    # ── C: tau vs SNR ────────────────────────────────────────────────────
     ax = axes[0, 2]
-    if result.detection_confidence is not None:
-        ax.hist(result.detection_confidence, bins=25, range=(0, 1),
-                color=C_GREEN, alpha=0.85, edgecolor='white', linewidth=0.5)
-        _annotate_median(ax, result.detection_confidence, C_GREEN)
-        _style(ax, 'Detection Stage Confidence', 'seed confidence (0–1)', 'number of neurons')
+    valid = g_fitted > 0
+    tau_plot = np.clip(tau_all, 0, tau_cap)
+    ax.scatter(snr[valid], tau_plot[valid], s=15, alpha=0.4, c='#4472C4')
+    ax.axhline(decay_time_initial, color='red', linestyle='--', alpha=0.7,
+               label=f'Initial τ = {decay_time_initial}s')
+    ax.axhline(np.median(tau_fitted), color='orange', linestyle='-', alpha=0.7,
+               label=f'Median fitted = {np.median(tau_fitted):.2f}s')
+    ax.set_xlabel('Trace SNR (p95−p5 / noise)', fontsize=18)
+    ax.set_ylabel('Fitted τ (s)', fontsize=18)
+    ax.set_title('C — Decay time vs trace quality', fontsize=24, fontweight='bold')
+    ax.legend(fontsize=18, loc='upper right')
+    ax.tick_params(labelsize=18)
+
+    # ── D–F: Example transients ──────────────────────────────────────────
+    n_spikes_per = np.array([int(np.sum(S[i] > 0)) for i in range(N)])
+    active = np.where((n_spikes_per >= 3) & (g_fitted > 0))[0]
+    t_ax = np.arange(T) / frame_rate
+
+    if len(active) >= 3:
+        tau_active = tau_all[active]
+        order = np.argsort(tau_active)
+        examples = [active[order[0]],
+                    active[order[len(order) // 2]],
+                    active[order[-1]]]
+        labels = ['D — Fastest decay', 'E — Median decay', 'F — Slowest decay']
+    elif len(active) > 0:
+        examples = list(active[:min(3, len(active))])
+        labels = [f'{chr(68+j)} — Example' for j in range(len(examples))]
     else:
-        ax.text(0.5, 0.5, 'Detection confidence\nnot available',
-                ha='center', va='center', transform=ax.transAxes,
-                fontsize=10, color=C_GREY)
-        _style(ax, 'Detection Stage Confidence')
+        examples, labels = [], []
 
-    # 1d. Calcium events per neuron
-    ax = axes[1, 0]
-    tc = result.transient_count
-    max_bin = min(int(np.percentile(tc, 99)) + 5, int(tc.max()) + 1) if tc.max() > 0 else 10
-    ax.hist(tc, bins=min(max_bin, 40), color=C_AMBER, alpha=0.85,
-            edgecolor='white', linewidth=0.5)
-    _annotate_median(ax, tc, C_AMBER)
-    _style(ax, 'Calcium Events per Neuron', 'number of detected events', 'number of neurons')
+    for j, (roi, label) in enumerate(zip(examples, labels)):
+        ax = axes[1, j]
+        ax.plot(t_ax, C_dff[roi], color='#aaa', alpha=0.4, linewidth=0.5,
+                label='Raw ΔF/F₀')
+        ax.plot(t_ax, C_den[roi], color='#00c853', linewidth=1.2,
+                label='OASIS denoised')
 
-    # 1e. Time spent active
-    ax = axes[1, 1]
-    af_pct = result.activity_fraction * 100
-    ax.hist(af_pct, bins=30, range=(0, 100), color=C_AMBER, alpha=0.85,
-            edgecolor='white', linewidth=0.5)
-    ax.axvspan(1, 60, alpha=0.06, color=C_GREEN)
-    ax.text(30, ax.get_ylim()[1] * 0.02 if ax.get_ylim()[1] > 0 else 0.5,
-            'typical range', ha='center', fontsize=7, color=C_GREEN, alpha=0.7)
-    _annotate_median(ax, af_pct, C_AMBER)
-    _style(ax, 'Time Spent Active', '% of recording active', 'number of neurons')
+        spk = np.where(S[roi] > 0)[0]
+        if len(spk) > 0:
+            ax.scatter(spk / frame_rate, C_den[roi, spk],
+                       color='red', s=25, zorder=5, label='Events')
 
-    # 1f. Indicator decay match
-    ax = axes[1, 2]
-    dv_pct = result.dynamics_validity * 100
-    ax.hist(dv_pct, bins=20, range=(0, 100), color=C_AMBER, alpha=0.85,
-            edgecolor='white', linewidth=0.5)
-    _annotate_median(ax, dv_pct, C_AMBER)
-    _style(ax, 'Calcium Indicator Decay Match', '% events with expected decay', 'number of neurons')
+        g_r = g_fitted[roi]
+        tau_r = tau_all[roi]
+        ax.set_title(f'{label}',
+                     fontsize=24, fontweight='bold')
+        ax.set_xlabel('Time (s)', fontsize=18)
+        ax.set_ylabel('ΔF/F₀', fontsize=18)
+        ax.legend(fontsize=18, loc='upper right')
+        ax.tick_params(labelsize=18)
+        ax.grid(alpha=0.15)
 
-    fig1.tight_layout(rect=[0, 0, 1, 0.93])
-    p1 = os.path.join(output_dir, f'neuron_quality_summary.{fmt}')
-    fig1.savefig(p1, dpi=dpi, bbox_inches='tight', facecolor='white')
-    plt.close(fig1)
-    paths.append(p1)
-    logger.info(f"  Saved: {p1}")
+    for j in range(len(examples), 3):
+        axes[1, j].axis('off')
 
-    # ── Figure 2: Quality Detail ─────────────────────────────────────
-
-    fig2, axes2 = plt.subplots(2, 2, figsize=(13, 9))
-    fig2.suptitle('Quality Detail', fontsize=13, fontweight='700',
-                  y=0.98, color='#1e293b')
-
-    # 2a. Baseline stability
-    ax = axes2[0, 0]
-    drift_pct = result.baseline_drift * 100
-    ax.hist(drift_pct, bins=30, color=C_AMBER, alpha=0.85,
-            edgecolor='white', linewidth=0.5)
-    ax.axvline(30, color=C_RED, linestyle='--', linewidth=1, alpha=0.7)
-    n_high = (result.baseline_drift > 0.3).sum()
-    if n_high > 0:
-        ax.text(0.97, 0.92, f'{n_high} neuron{"s" if n_high > 1 else ""} with unstable baseline',
-                transform=ax.transAxes, ha='right', fontsize=8, color=C_RED)
-    _style(ax, 'Baseline Stability', 'baseline drift (% of signal range)', 'number of neurons')
-
-    # 2b. Events vs decay match (coloured by confidence)
-    ax = axes2[0, 1]
-    sc = ax.scatter(
-        result.transient_count, result.dynamics_validity * 100,
-        c=result.confidence, cmap='RdYlGn', s=14, alpha=0.6,
-        edgecolors='none', vmin=0, vmax=1,
-    )
-    cb = plt.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
-    cb.set_label('confidence', fontsize=8)
-    cb.ax.tick_params(labelsize=7)
-    _style(ax, 'Events vs Decay Match', 'calcium events', '% events with expected decay')
-
-    # 2c. Confidence source breakdown
-    ax = axes2[1, 0]
-    det_contrib = 0.45 * np.mean(
-        result.detection_confidence
-        if result.detection_confidence is not None
-        else np.full(n, 0.5)
-    )
-    temp_contrib = 0.55 * np.mean(_temporal_score(
-        result.transient_count, result.activity_fraction,
-        result.baseline_drift, result.dynamics_validity,
-    ))
-    labels = ['Spatial\nDetection', 'Temporal\nActivity']
-    values = [det_contrib, temp_contrib]
-    colours = [C_BLUE, C_AMBER]
-
-    bars = ax.bar(labels, values, color=colours, alpha=0.85, edgecolor='white',
-                  linewidth=1.5, width=0.55)
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.008,
-                f'{val:.3f}', ha='center', fontsize=9, fontweight='600', color='#334155')
-    ax.set_ylim(0, max(values) * 1.3 + 0.01)
-    _style(ax, 'Mean Confidence Breakdown', None, 'weighted contribution to score')
-
-    # 2d. Ranked confidence curve
-    ax = axes2[1, 1]
-    sorted_conf = np.sort(result.confidence)[::-1]
-    ranks = np.arange(1, n + 1)
-    ax.fill_between(ranks, sorted_conf, alpha=0.2, color=C_BLUE)
-    ax.plot(ranks, sorted_conf, color=C_BLUE, linewidth=1.8)
-    med = np.median(result.confidence)
-    ax.axhline(med, color='#334155', linestyle='--', linewidth=1,
-               label=f'median = {med:.2f}')
-    ax.axhline(0.5, color=C_GREY, linestyle=':', linewidth=0.8, alpha=0.6)
-    ax.set_xlim(1, n)
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=8, loc='lower left',
-              frameon=True, facecolor='white', edgecolor='#e2e8f0')
-    _style(ax, 'Confidence by Neuron Rank', 'neuron (ranked best → worst)', 'confidence')
-
-    fig2.tight_layout(rect=[0, 0, 1, 0.95])
-    p2 = os.path.join(output_dir, f'quality_detail.{fmt}')
-    fig2.savefig(p2, dpi=dpi, bbox_inches='tight', facecolor='white')
-    plt.close(fig2)
-    paths.append(p2)
-    logger.info(f"  Saved: {p2}")
-
-    # ── Figure 3: Spatial Activity Map ───────────────────────────────
-
-    if A is not None and dims is not None:
-        try:
-            paths.extend(_generate_spatial_activity_map(
-                result, A, dims, output_dir,
-                C=C, frame_rate=frame_rate, decay_time=decay_time,
-                max_projection=max_projection,
-                fmt=fmt, dpi=dpi,
-            ))
-        except Exception as exc:
-            logger.warning(f"  Spatial activity map failed: {exc}")
-
-    return paths
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    path = os.path.join(output_dir, 'decay_diagnostics.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    logger.info(f"  Saved decay diagnostics: {path}")
+    return path
 
 
-def _generate_spatial_activity_map(
-    result: DiagnosticResult,
-    A,
-    dims: tuple,
-    output_dir: str,
-    *,
-    C: Optional[np.ndarray] = None,
-    frame_rate: Optional[float] = None,
-    decay_time: float = 1.0,
-    max_projection: Optional[np.ndarray] = None,
-    fmt: str = "png",
-    dpi: int = 150,
-) -> List[str]:
-    """
-    Generate spatial–temporal activity analysis.
+# =============================================================================
+# PER-ROI INSPECTION PNGS
+# =============================================================================
+# These helpers were previously private inside ``run_full_pipeline.py``.
+# They are used only by :func:`generate_per_roi_pngs`.
 
-    Six-panel figure (3×2):
+def _get_roi_weights(A, roi_idx, dims):
+    """Extract spatial weight map for an ROI."""
+    if hasattr(A, 'toarray'):
+        w = A[:, roi_idx].toarray().flatten()
+    else:
+        w = A[:, roi_idx].flatten()
+    return w.reshape(dims)
 
-    Row 1:
-    1. **Max projection reference** — raw max projection with neuron
-       centroids overlaid. Serves as orientation reference so the
-       reader can verify spatial alignment with the raw movie.
-    2. **Activity hotspot map (KDE)** — Gaussian-smoothed event rate
-       density, weighted by event frequency.
-    3. **Neuron confidence map** — FOV with neurons colour-coded by
-       confidence score, size scaled by event count.
 
-    Row 2:
-    4. **Calcium event raster** — detected events as tick marks,
-       neurons sorted by event frequency, colour-coded by confidence.
-    5. **Population activity** — histogram of summed events per time
-       bin, with synchronous burst detection.
+def _get_roi_centroid(weights):
+    """Return (cy, cx) weighted centroid of footprint."""
+    ys, xs = np.where(weights > 0)
+    if len(ys) == 0:
+        return None
+    cy = float(np.average(ys, weights=weights[ys, xs]))
+    cx = float(np.average(xs, weights=weights[ys, xs]))
+    return cy, cx
 
-    Parameters
-    ----------
-    max_projection : 2D array (H, W), optional
-        Raw max-intensity projection from the movie. If None, a
-        composite footprint image is used as background.
-    """
+
+def _pad_crop(frame, cy, cx, half_size):
+    """Crop a square window around (cy, cx), padding with frame minimum."""
+    H, W = frame.shape
+    size = 2 * half_size
+    out = np.full((size, size), frame.min(), dtype=frame.dtype)
+    src_y0 = int(round(cy)) - half_size
+    src_x0 = int(round(cx)) - half_size
+    dst_y0 = max(0, -src_y0)
+    dst_x0 = max(0, -src_x0)
+    sy0 = max(0, src_y0); sy1 = min(H, src_y0 + size)
+    sx0 = max(0, src_x0); sx1 = min(W, src_x0 + size)
+    h = sy1 - sy0; w = sx1 - sx0
+    if h > 0 and w > 0:
+        out[dst_y0:dst_y0 + h, dst_x0:dst_x0 + w] = frame[sy0:sy1, sx0:sx1]
+    return out
+
+
+def _pad_crop_mask(mask2d, cy, cx, half_size):
+    return _pad_crop(mask2d.astype(np.float32), cy, cx, half_size)
+
+
+def _find_peak_frame(trace, frame_rate):
+    from scipy.signal import find_peaks
+    F0 = np.percentile(trace, 20)
+    scale = np.percentile(trace, 95) - F0 + 1e-10
+    norm = (trace - F0) / scale
+    peaks, _ = find_peaks(norm, height=0.3, distance=int(frame_rate), prominence=0.2)
+    if len(peaks) == 0:
+        return int(np.argmax(trace))
+    return int(peaks[np.argmax(trace[peaks])])
+
+
+def _find_baseline_frame(trace):
+    F0 = np.percentile(trace, 20)
+    thresh = F0 + 0.1 * (trace.max() - F0)
+    quiet = np.where(trace <= thresh)[0]
+    if len(quiet) == 0:
+        return int(np.argmin(trace))
+    mid = len(trace) // 2
+    return int(quiet[np.argmin(np.abs(quiet - mid))])
+
+
+def _compute_dff(trace):
+    F0 = np.percentile(trace, 20)
+    if F0 > 1e-6:
+        return (trace - F0) / F0 * 100, 'ΔF/F (%)'
+    return trace - trace.min(), 'F - F_min'
+
+
+def generate_per_roi_pngs(
+    A_final, C_final, movie, dims, projections, frame_rate,
+    output_dir,
+):
+    """Generate per-ROI inspection PNGs (peak-frame sequence + trace per ROI)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from matplotlib.gridspec import GridSpec
-    from matplotlib.colors import Normalize, LinearSegmentedColormap
-    from matplotlib.cm import ScalarMappable
-    from scipy.sparse import issparse
-    from scipy.ndimage import gaussian_filter
-    import os
+    import matplotlib.gridspec as mpl_gridspec
 
-    paths = []
-    n = result.n_components
-    H, W = dims
+    n_final = A_final.shape[1]
+    inspection_dir = os.path.join(output_dir, 'inspection')
+    os.makedirs(inspection_dir, exist_ok=True)
 
-    # --- Compute centroids ---
-    A_dense = A.toarray() if issparse(A) else np.asarray(A)
-    cy = np.zeros(n)
-    cx = np.zeros(n)
-    for i in range(n):
-        col = A_dense[:, i]
-        if col.sum() > 0:
-            fp = col.reshape(dims)
-            yy, xx = np.mgrid[:H, :W]
-            total = fp.sum()
-            cy[i] = (yy * fp).sum() / total
-            cx[i] = (xx * fp).sum() / total
+    # Sort by mean activity (descending) so the highest-signal ROIs come first
+    activity = np.array([np.percentile(C_final[i], 95) - np.percentile(C_final[i], 5)
+                         for i in range(n_final)])
+    sort_idx = np.argsort(activity)[::-1]
 
-    # --- Event rate ---
-    tc = result.transient_count.copy()
-    has_time = frame_rate is not None and frame_rate > 0
-    if has_time and C is not None:
-        T_sec = C.shape[1] / frame_rate
-        event_rate = tc / max(T_sec / 60.0, 0.01)
-        rate_label = 'events / min'
-    else:
-        event_rate = tc.astype(float)
-        rate_label = 'total events'
+    logger.info(f"  Generating {n_final} per-ROI inspection PNGs...")
 
-    # --- Detect event times for raster ---
-    event_times = []
-    if C is not None:
-        for i in range(n):
-            peaks = _detect_calcium_events(
-                C[i, :], frame_rate or 2.0, decay_time=decay_time,
-            )
-            event_times.append(peaks)
+    image_paths = []
+    T_movie = len(movie)
 
-        for i in range(n):
-            tc[i] = len(event_times[i])
-        if has_time:
-            T_sec = C.shape[1] / frame_rate
-            event_rate = tc / max(T_sec / 60.0, 0.01)
-        else:
-            event_rate = tc.astype(float)
-    else:
-        event_times = [np.array([]) for _ in range(n)]
+    for plot_i, roi_idx in enumerate(sort_idx):
+        try:
+            weights = _get_roi_weights(A_final, roi_idx, dims)
+            centroid = _get_roi_centroid(weights)
+            if centroid is None:
+                continue
 
-    # --- Background images ---
-    # Composite footprint background
-    max_fp = np.zeros(dims, dtype=np.float32)
-    for i in range(n):
-        fp = A_dense[:, i].reshape(dims)
-        max_fp = np.maximum(max_fp, fp)
-    bg_fp = max_fp / (max_fp.max() + 1e-10)
+            cy, cx = centroid
+            w_thresh = max(weights.max() * 0.2, 1e-10)
+            TIGHT = 60
 
-    # Max projection (normalised for display)
-    if max_projection is not None:
-        mp = max_projection.astype(np.float32)
-        mp_display = (mp - mp.min()) / (mp.max() - mp.min() + 1e-10)
-    else:
-        mp_display = bg_fp
+            trace = C_final[roi_idx, :]
+            dff, ylabel = _compute_dff(trace)
+            peak_t = _find_peak_frame(trace, frame_rate)
+            base_t = _find_baseline_frame(trace)
 
-    # --- Colour palette ---
-    C_GREY = '#94a3b8'
+            T_trace = len(trace)
+            peak_f = min(int(peak_t * T_movie / T_trace), T_movie - 1)
 
-    def _style(ax, title, xlabel=None, ylabel=None):
-        ax.set_title(title, fontsize=11, fontweight='600', pad=8, color='#1e293b')
-        if xlabel:
-            ax.set_xlabel(xlabel, fontsize=9, color='#475569')
-        if ylabel:
-            ax.set_ylabel(ylabel, fontsize=9, color='#475569')
-        ax.tick_params(labelsize=8, colors='#64748b')
+            title = f"ROI #{roi_idx}  (Rank {plot_i + 1}/{n_final})"
 
-    # ── Layout: 3 columns × 2 rows ──────────────────────────────────
-    # Top row: 3 equal-sized spatial panels (no colorbar stealing space)
-    # Bottom row: full-width population activity
+            fig = plt.figure(figsize=(20, 6), facecolor='#1a1a2e')
+            gs_roi = mpl_gridspec.GridSpec(
+                2, 11, height_ratios=[1, 1.5], hspace=0.4, wspace=0.08)
+            fig.suptitle(title, fontsize=12, fontweight='bold', color='#ccc')
 
-    fig = plt.figure(figsize=(18, 10))
-    gs = GridSpec(2, 3, figure=fig, hspace=0.22, wspace=0.06,
-                  height_ratios=[1.2, 0.65])
-    ax_ref  = fig.add_subplot(gs[0, 0])
-    ax_kde  = fig.add_subplot(gs[0, 1])
-    ax_conf = fig.add_subplot(gs[0, 2])
-    ax_pop  = fig.add_subplot(gs[1, :])  # full width
+            offsets = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
+            w_tight = _pad_crop_mask(weights, cy, cx, TIGHT)
 
-    fig.suptitle('Spatial & Temporal Activity Analysis',
-                 fontsize=14, fontweight='700', y=0.99, color='#1e293b')
+            sequence_crops = [
+                _pad_crop(movie[max(0, min(T_movie - 1, peak_f + offset))],
+                          cy, cx, TIGHT)
+                for offset in offsets
+            ]
 
-    def _clean_spatial(ax):
-        """Remove all ticks and spines from spatial panels."""
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_visible(False)
+            vlo = np.percentile(sequence_crops, 1)
+            vhi = np.percentile(sequence_crops, 99.5)
+            if vhi <= vlo:
+                vhi = vlo + 1
 
-    # ── Panel 1: Max projection + ROI contours ────────────────────────
+            for i, (offset, crop) in enumerate(zip(offsets, sequence_crops)):
+                ax = fig.add_subplot(gs_roi[0, i])
+                ax.set_facecolor('#1a1a2e')
+                ax.imshow(crop, cmap='gray', vmin=vlo, vmax=vhi, interpolation='none')
+                ax.contour(w_tight, levels=[w_thresh],
+                           colors=['cyan'], linewidths=1.2, alpha=0.8)
+                if offset == 0:
+                    ax.set_title(f"Peak (t={peak_t / frame_rate:.1f}s)",
+                                 fontsize=10, color='lime', fontweight='bold')
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor('lime'); spine.set_linewidth(2)
+                else:
+                    label = f"+{offset}" if offset > 0 else str(offset)
+                    ax.set_title(f"Peak {label}", fontsize=9, color='#ccc')
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor('#444')
+                ax.axis('off')
 
-    ax_ref.imshow(mp_display, cmap='gray', vmin=0, vmax=1)
-    for i in range(n):
-        fp = A_dense[:, i].reshape(dims)
-        if fp.max() > 0:
-            ax_ref.contour(fp, levels=[fp.max() * 0.25],
-                           colors=['#22d3ee'], linewidths=0.5, alpha=0.7)
-    ax_ref.set_xlim(0, W); ax_ref.set_ylim(H, 0); ax_ref.set_aspect('equal')
-    _clean_spatial(ax_ref)
-    title_ref = 'Max Projection + ROI Contours' if max_projection is not None \
-                else 'Composite Footprints + ROI Contours'
-    ax_ref.set_title(title_ref, fontsize=11, fontweight='600', pad=8, color='#1e293b')
+            ax_trace = fig.add_subplot(gs_roi[1, :])
+            ax_trace.set_facecolor('#111')
+            t_ax = np.arange(len(dff)) / frame_rate
+            ax_trace.plot(t_ax, dff, color='#4fc3f7', linewidth=1.0)
+            ax_trace.axhline(0, color='#555', linewidth=0.5)
+            ax_trace.axvline(base_t / frame_rate, color='cyan',
+                             linestyle='--', linewidth=1.2, label='Baseline')
+            ax_trace.axvline(peak_t / frame_rate, color='lime',
+                             linestyle='--', linewidth=1.2, label='Peak')
+            win_lo = max(0, (peak_f - 5)) / frame_rate
+            win_hi = min(T_movie - 1, (peak_f + 5)) / frame_rate
+            ax_trace.axvspan(win_lo, win_hi, alpha=0.2, color='lime',
+                             label='Image Sequence Window')
+            ax_trace.set_xlabel('Time (s)', color='#aaa', fontsize=9)
+            ax_trace.set_ylabel(ylabel, color='#aaa', fontsize=9)
+            ax_trace.set_title('Calcium Trace (Processed)',
+                               fontsize=10, color='#ccc')
+            ax_trace.legend(fontsize=8, framealpha=0.3,
+                            labelcolor='white', facecolor='white',
+                            loc='upper right')
+            ax_trace.set_xlim(0, t_ax[-1])
+            ax_trace.grid(True, alpha=0.2, color='#444')
+            ax_trace.tick_params(colors='#aaa')
+            for spine in ax_trace.spines.values():
+                spine.set_edgecolor('#444')
 
-    # ── Panel 2: KDE activity heatmap ─────────────────────────────────
+            img_path = os.path.join(inspection_dir, f'roi_{roi_idx:04d}.png')
+            plt.savefig(img_path, dpi=100, bbox_inches='tight', facecolor='white')
+            plt.close()
+            image_paths.append(img_path)
 
-    density = np.zeros((H, W), dtype=np.float32)
-    for i in range(n):
-        yi, xi = int(round(cy[i])), int(round(cx[i]))
-        if 0 <= yi < H and 0 <= xi < W:
-            density[yi, xi] += event_rate[i]
-    density_smooth = gaussian_filter(density, sigma=max(H, W) / 20.0)
+        except Exception as roi_err:
+            logger.warning(f"    ROI #{roi_idx} image failed: {roi_err}")
+            plt.close('all')
+            continue
 
-    ax_kde.imshow(mp_display, cmap='gray', vmin=0, vmax=1, alpha=0.3)
-    im_kde = ax_kde.imshow(density_smooth, cmap='magma', alpha=0.75,
-                           vmin=0, vmax=np.percentile(density_smooth, 98) + 1e-10)
-    ax_kde.scatter(cx, cy, s=6, c='white', edgecolors='none', alpha=0.35, zorder=5)
-    ax_kde.set_xlim(0, W); ax_kde.set_ylim(H, 0); ax_kde.set_aspect('equal')
-    _clean_spatial(ax_kde)
-    ax_kde.set_title('Activity Hotspot Map (KDE)', fontsize=11,
-                     fontweight='600', pad=8, color='#1e293b')
+        if (plot_i + 1) % 50 == 0:
+            logger.info(f"    Generated {plot_i + 1}/{n_final} ROI images")
 
-    # Inset colorbar — sits inside the panel, bottom-right
-    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-    cax1 = inset_axes(ax_kde, width="35%", height="3%", loc='lower right',
-                      borderpad=1.5)
-    cb1 = fig.colorbar(im_kde, cax=cax1, orientation='horizontal')
-    cb1.set_label(rate_label, fontsize=7, color='white')
-    cb1.ax.tick_params(labelsize=6, colors='white', length=0)
-    cb1.outline.set_visible(False)
-
-    # ── Panel 3: Confidence spatial map ───────────────────────────────
-
-    ax_conf.imshow(mp_display, cmap='gray', vmin=0, vmax=1, alpha=0.3)
-    size = np.clip(tc / (tc.max() + 1e-10) * 80 + 6, 6, 100)
-    sc = ax_conf.scatter(
-        cx, cy, c=result.confidence, cmap='RdYlGn',
-        s=size, vmin=0, vmax=1,
-        edgecolors='white', linewidths=0.3, alpha=0.85, zorder=5,
-    )
-    ax_conf.set_xlim(0, W); ax_conf.set_ylim(H, 0); ax_conf.set_aspect('equal')
-    _clean_spatial(ax_conf)
-    ax_conf.set_title(f'Neuron Confidence Map ({n} neurons)', fontsize=11,
-                      fontweight='600', pad=8, color='#1e293b')
-
-    cax2 = inset_axes(ax_conf, width="35%", height="3%", loc='lower right',
-                      borderpad=1.5)
-    cb2 = fig.colorbar(sc, cax=cax2, orientation='horizontal')
-    cb2.set_label('confidence', fontsize=7, color='white')
-    cb2.ax.tick_params(labelsize=6, colors='white', length=0)
-    cb2.outline.set_visible(False)
-
-    # ── Bottom panel: Population activity (frame-based, full width) ────
-
-    if C is not None:
-        T_frames = C.shape[1]
-
-        # Per-frame event count across all neurons
-        pop_per_frame = np.zeros(T_frames, dtype=int)
-        for i in range(n):
-            peaks = event_times[i]
-            for pk in peaks:
-                if 0 <= pk < T_frames:
-                    pop_per_frame[pk] += 1
-
-        # Smooth with a small window for visualisation
-        from scipy.ndimage import uniform_filter1d
-        smooth_width = max(3, int(frame_rate * 0.5)) if has_time else 3
-        pop_smooth = uniform_filter1d(pop_per_frame.astype(float), size=smooth_width)
-
-        frames = np.arange(T_frames)
-        ax_pop.fill_between(frames, pop_per_frame, alpha=0.3, color='#3b82f6',
-                            step='mid')
-        ax_pop.step(frames, pop_per_frame, where='mid',
-                    color='#3b82f6', alpha=0.4, linewidth=0.5)
-        ax_pop.plot(frames, pop_smooth, color='#1e40af',
-                    linewidth=1.8, alpha=0.9)
-
-        mean_rate = pop_per_frame.mean()
-        ax_pop.axhline(mean_rate, color='#94a3b8', linestyle='--',
-                       linewidth=1, alpha=0.6,
-                       label=f'mean: {mean_rate:.2f} events/frame')
-
-        # Flag synchronous bursts (>2σ above mean)
-        std_rate = pop_per_frame.std()
-        if std_rate > 0:
-            burst_thresh = mean_rate + 2 * std_rate
-            burst_mask = pop_per_frame > burst_thresh
-            if burst_mask.any():
-                ax_pop.fill_between(
-                    frames, 0, pop_per_frame,
-                    where=burst_mask, alpha=0.3, color='#ef4444',
-                    step='mid',
-                    label=f'synchronous bursts (>{burst_thresh:.0f})',
-                )
-
-        ax_pop.set_xlim(0, T_frames)
-        ax_pop.set_ylim(0, None)
-        ax_pop.legend(fontsize=7.5, loc='upper right',
-                      frameon=True, facecolor='white', edgecolor='#e2e8f0')
-        _style(ax_pop, 'Population Activity',
-               'frame', 'simultaneous events')
-    else:
-        ax_pop.text(0.5, 0.5, 'Temporal data not available',
-                    ha='center', va='center', transform=ax_pop.transAxes,
-                    fontsize=11, color=C_GREY)
-        _style(ax_pop, 'Population Activity')
-
-    p3 = os.path.join(output_dir, f'spatial_activity_map.{fmt}')
-    fig.savefig(p3, dpi=dpi, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    paths.append(p3)
-    logger.info(f"  Saved: {p3}")
-
-    return paths
-
-
-
+    logger.info(f"  Generated {len(image_paths)} per-ROI inspection PNGs")
+    return image_paths

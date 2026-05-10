@@ -17,24 +17,25 @@ Approach
 Input
 -----
 Pipeline output directories from batch-processed datasets, each containing:
-- temporal_traces.npy     (N × T)
-- confidence_scores.npy   (N,)
-- diagnostics.npz         (transient_count, activity_fraction, etc.)
-- spatial_footprints.npz  (sparse, d1*d2 × N)
-- run_info.json           (frame_rate, dims, etc.)
+- run_info.json                     (frame_rate, dims, etc.)
+- data/temporal_traces.npy          (N × T)
+- data/spatial_footprints.npz       (sparse, d1*d2 × N)
+- data/spike_trains.npy             (N × T, optional)
+- data/traces_denoised.npy          (N × T, optional)
 
 Output
 ------
-- dataset_features.csv          Per-dataset feature matrix
-- figures/                      All figures
-- analysis_results.json         Full results with per-dataset metrics
+- data/dataset_features.csv         Per-dataset feature matrix
+- data/selected_rois.csv            Per-ROI listing
+- data/quality_gating.json          Motion / drift gating decisions
+- figures/                          All figures
+- analysis_results.json             Full results with per-dataset metrics
 
 Usage
 -----
     python -m src.group_analysis \\
         --results-dir /path/to/batch_results \\
-        --output /path/to/analysis \\
-        --confidence-threshold 0.5
+        --output /path/to/analysis
 
 Author: Calcium Pipeline
 """
@@ -127,43 +128,6 @@ def _trace_snr(trace: np.ndarray) -> float:
     return float(signal / noise)
 
 
-def _ensure_traces_dff(C: np.ndarray) -> np.ndarray:
-    """
-    Ensure traces are in ΔF/F₀ space for display and SNR computation.
-
-    If median absolute value > 1.0, traces are likely raw fluorescence
-    (values ~1e3–1e7) rather than ΔF/F₀ (values ~0, with transients
-    at 0.01–5.0).  Convert per-trace using rolling baseline.
-
-    This guards against traces_denoised.npy files generated before
-    the _ensure_dff fix was added to deconvolution.
-    """
-    median_abs = np.median(np.abs(C))
-    if median_abs <= 1.0:
-        return C  # already ΔF/F₀
-
-    logger.info(f"  _ensure_traces_dff: median |trace| = {median_abs:.1f}, "
-                f"converting to ΔF/F₀")
-
-    N, T = C.shape
-    C_out = np.zeros_like(C, dtype=np.float64)
-    win = max(T // 10, 50)
-
-    for i in range(N):
-        trace = C[i].astype(np.float64)
-        from scipy.ndimage import minimum_filter1d
-        baseline = minimum_filter1d(trace, size=win)
-        # Smooth baseline to avoid division artefacts
-        from scipy.ndimage import uniform_filter1d
-        baseline = uniform_filter1d(baseline, size=win // 2)
-        # Floor at 1% of trace median or 1st percentile, whichever is larger
-        trace_median = np.median(trace[trace > 0]) if np.any(trace > 0) else 1.0
-        baseline = np.maximum(baseline, max(np.percentile(trace, 1), trace_median * 0.01))
-        C_out[i] = np.clip((trace - baseline) / baseline, -1.0, 100.0)
-
-    return C_out.astype(np.float32)
-
-
 def _load_valid_mask(result_path) -> np.ndarray:
     """
     Return a boolean mask of valid ROIs for a dataset.
@@ -177,8 +141,8 @@ def _load_valid_mask(result_path) -> np.ndarray:
     result_path = Path(result_path)
 
     # Try to infer N from spike trains
-    spikes_path = result_path / 'spike_trains.npy'
-    traces_path = result_path / 'temporal_traces.npy'
+    spikes_path = result_path / 'data' / 'spike_trains.npy'
+    traces_path = result_path / 'data' / 'temporal_traces.npy'
     if spikes_path.exists():
         N = np.load(spikes_path, mmap_mode='r').shape[0]
     elif traces_path.exists():
@@ -228,7 +192,6 @@ class DatasetMetrics:
 
     # Per-neuron arrays (all confident neurons)
     all_quality_scores: Optional[np.ndarray] = None
-    confidence_scores: Optional[np.ndarray] = None
 
     # Per-neuron arrays (selected neurons) — precomputed to avoid storing full traces
     neuron_spike_rates: Optional[np.ndarray] = None      # (n_selected,) events/10s
@@ -316,20 +279,18 @@ def load_dataset_metrics(
     """
     result_path = Path(result_dir)
 
-    denoised_path = result_path / 'traces_denoised.npy'
-    spikes_path = result_path / 'spike_trains.npy'
-    traces_path = result_path / 'temporal_traces.npy'
-    conf_path = result_path / 'confidence_scores.npy'
+    denoised_path = result_path / 'data' / 'traces_denoised.npy'
+    spikes_path = result_path / 'data' / 'spike_trains.npy'
+    traces_path = result_path / 'data' / 'temporal_traces.npy'
 
     if not traces_path.exists():
         logger.warning(f"  {name}: temporal_traces.npy not found, skipping")
         return None
 
     C_raw = np.load(traces_path)
-    confidence = np.load(conf_path) if conf_path.exists() else np.ones(C_raw.shape[0])
 
     # Load raw fluorescence traces (for local ΔF/F amplitude measurement)
-    raw_fluor_path = result_path / 'temporal_traces_raw.npy'
+    raw_fluor_path = result_path / 'data' / 'temporal_traces_raw.npy'
     C_raw_fluorescence = np.load(raw_fluor_path) if raw_fluor_path.exists() else None
 
     # Check which amplitude method was used for this dataset
@@ -347,7 +308,7 @@ def load_dataset_metrics(
     # Load deconvolved data
     has_deconv = denoised_path.exists() and spikes_path.exists()
     if has_deconv:
-        C_denoised = _ensure_traces_dff(np.load(denoised_path))
+        C_denoised = np.load(denoised_path)
         S = np.load(spikes_path)
     else:
         logger.warning(f"  {name}: no deconvolution data — quality selection not possible, skipping")
@@ -415,9 +376,9 @@ def load_dataset_metrics(
     # Each crop is a dict with 'max_proj', 'baseline', 'contour' arrays
     roi_crops = None
     A_sparse = None
-    footprint_path = result_path / 'spatial_footprints.npz'
-    max_proj_path = result_path / 'max_projection.npy'
-    mean_proj_path = result_path / 'mean_projection.npy'
+    footprint_path = result_path / 'data' / 'spatial_footprints.npz'
+    max_proj_path = result_path / 'data' / 'max_projection.npy'
+    mean_proj_path = result_path / 'data' / 'mean_projection.npy'
     info_path_spatial = result_path / 'run_info.json'
     try:
         if footprint_path.exists():
@@ -635,7 +596,6 @@ def load_dataset_metrics(
         selected_spikes=S_sel,
         selected_roi_crops=roi_crops,
         all_quality_scores=None,
-        confidence_scores=None,
         mean_spike_rate=mean_spike_rate,
         median_spike_rate=median_spike_rate,
         mean_spike_amplitude=mean_spike_amp,
@@ -679,7 +639,7 @@ def load_dataset_metrics(
     logger.info(f"    baseline_drift={drift_ratio:.3f}")
 
     # ── Motion quality ───────────────────────────────────────────────────
-    shifts_path = result_path / 'motion_shifts.npy'
+    shifts_path = result_path / 'data' / 'motion_shifts.npy'
     mc_info = {}
     if info_path.exists():
         with open(info_path) as f:
@@ -788,7 +748,6 @@ def load_dataset_metrics(
 #
 # QUALITY CONTROL:
 #
-#   - Only neurons with confidence >= 0.3 are considered
 #   - Edge-touching ROIs are excluded (boundary_touching.npy)
 #   - Top N neurons by composite quality score are selected
 #   - Quality score combines: SNR, spike discreteness, baseline stability,
@@ -1467,7 +1426,7 @@ def run_analysis(
     for subdir in sorted(results_path.iterdir()):
         if not subdir.is_dir():
             continue
-        if not (subdir / 'temporal_traces.npy').exists():
+        if not (subdir / 'data' / 'temporal_traces.npy').exists():
             continue
         ds = load_dataset_metrics(
             str(subdir), subdir.name,

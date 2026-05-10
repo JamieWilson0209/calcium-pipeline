@@ -364,7 +364,8 @@ def generate_spectral_figures(global_trace, freqs, psd, bursts, std_map,
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Temporal std')
 
     plt.tight_layout()
-    path = os.path.join(output_dir, 'network_spectral_analysis.png')
+    path = os.path.join(output_dir, 'figures', 'network_spectral_analysis.png')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     logger.info(f"  Spectral figure saved: {path}")
@@ -435,7 +436,7 @@ def run_network_spectral(movie, frame_rate, output_dir, dataset_name='',
 
     # Step 6: Figures
     logger.info("  Generating figures...")
-    dev_dir = os.path.join(output_dir, 'dev_network')
+    dev_dir = os.path.join(output_dir, 'data', 'dev_network')
     fig_path = generate_spectral_figures(
         global_trace, freqs, psd, bursts, std_map,
         frame_rate, dev_dir, dataset_name,

@@ -180,7 +180,6 @@ def extract_roi_data(seeds, movie, frame_rate, max_rois=500,
             'id': i,
             'center': [float(y), float(x)],
             'radius': float(r),
-            'confidence': float(seeds.confidence[i]),
             'has_contour': bool(seeds.contour_success[i]),
             'contour_points': contour_pts,
             'circularity': float(circularity) if circularity is not None else None,
@@ -329,9 +328,6 @@ html,body{{height:100%;overflow:hidden;background:var(--bg0);color:var(--ink);
   </div>
   <div class="sect">
     <div class="sect-hd">Filters</div>
-    <div class="sl-row"><span>Min conf</span>
-      <input type="range" id="fConf" min="0" max="100" value="0">
-      <span class="sv" id="fConfV">0.00</span></div>
     <div class="sl-row"><span>Min radius</span>
       <input type="range" id="fRad" min="0" max="50" value="0">
       <span class="sv" id="fRadV">0</span></div>
@@ -390,7 +386,6 @@ html,body{{height:100%;overflow:hidden;background:var(--bg0);color:var(--ink);
     <div class="meta">
       <div class="mc"><div class="l">Rank</div><div class="v" id="dRank">—</div></div>
       <div class="mc"><div class="l">SNR</div><div class="v" id="dSnr">—</div></div>
-      <div class="mc"><div class="l">Confidence</div><div class="v" id="dConf">—</div></div>
       <div class="mc"><div class="l">Radius</div><div class="v" id="dRad">—</div></div>
       <div class="mc"><div class="l">Circularity</div><div class="v" id="dCirc">—</div></div>
       <div class="mc"><div class="l">Center Y,X</div><div class="v" id="dCtr">—</div></div>
@@ -438,7 +433,7 @@ let curDisp=0,zoom=1,panX=0,panY=0;
 let dragging=false,dragStart={{x:0,y:0}};
 let selRoi=null;
 let showContours=true,showCircles=true,showLabels=false;
-let showFallback=true,showEdge=true,minConf=0,minRadius=0;
+let showFallback=true,showEdge=true,minRadius=0;
 
 // Image cache
 const IMG_CACHE=new Map();
@@ -470,7 +465,7 @@ function renderFrame(){{
 const cssv=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 function getVisible(){{
   return roiData.filter(r=>
-    r.confidence>=minConf && r.radius>=minRadius &&
+    r.radius>=minRadius &&
     (showFallback||r.has_contour) && (showEdge||!r.boundary_touching));
 }}
 function roiColor(roi){{
@@ -602,7 +597,6 @@ function selectRoi(id){{
     document.getElementById('dId').textContent=roi.id;
     document.getElementById('dRank').textContent='#'+roi.rank;
     document.getElementById('dSnr').textContent=roi.snr.toFixed(1);
-    document.getElementById('dConf').textContent=roi.confidence.toFixed(3);
     document.getElementById('dRad').textContent=roi.radius.toFixed(1)+'px';
     document.getElementById('dCirc').textContent=roi.circularity!=null?roi.circularity.toFixed(3):'—';
     document.getElementById('dCtr').textContent=roi.center[0].toFixed(0)+', '+roi.center[1].toFixed(0);
@@ -681,7 +675,6 @@ document.getElementById('chkCircles').onchange=e=>{{showCircles=e.target.checked
 document.getElementById('chkLabels').onchange=e=>{{showLabels=e.target.checked;drawOverlay();}};
 document.getElementById('chkFallback').onchange=e=>{{showFallback=e.target.checked;drawOverlay();populateList();}};
 document.getElementById('chkEdge').onchange=e=>{{showEdge=e.target.checked;drawOverlay();populateList();}};
-document.getElementById('fConf').oninput=e=>{{minConf=e.target.value/100;document.getElementById('fConfV').textContent=minConf.toFixed(2);drawOverlay();populateList();}};
 document.getElementById('fRad').oninput=e=>{{minRadius=parseInt(e.target.value);document.getElementById('fRadV').textContent=minRadius;drawOverlay();populateList();}};
 document.getElementById('roiSearch').oninput=e=>populateList(e.target.value);
 

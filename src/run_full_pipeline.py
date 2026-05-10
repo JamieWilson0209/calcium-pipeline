@@ -51,6 +51,43 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# OUTPUT LAYOUT
+# =============================================================================
+# Per-recording outputs are organised as
+#   <output>/
+#     ├── run_info.json
+#     ├── gallery.html  (etc.)
+#     ├── data/         numerical results (.npy, .npz)
+#     ├── figures/      diagnostic / inspection images (.png)
+#     └── diagnostics/  pipeline JSON dumps + a few targeted figures
+
+DATA_SUBDIR        = 'data'
+FIGURES_SUBDIR     = 'figures'
+DIAGNOSTICS_SUBDIR = 'diagnostics'
+
+
+def _ensure_output_layout(output: str) -> None:
+    """Create data/, figures/, and diagnostics/ inside the output dir."""
+    for sub in (DATA_SUBDIR, FIGURES_SUBDIR, DIAGNOSTICS_SUBDIR):
+        os.makedirs(os.path.join(output, sub), exist_ok=True)
+
+
+def data_path(output: str, *parts: str) -> str:
+    """Path inside <output>/data/."""
+    return os.path.join(output, DATA_SUBDIR, *parts)
+
+
+def figure_path(output: str, *parts: str) -> str:
+    """Path inside <output>/figures/."""
+    return os.path.join(output, FIGURES_SUBDIR, *parts)
+
+
+def diagnostics_path(output: str, *parts: str) -> str:
+    """Path inside <output>/diagnostics/."""
+    return os.path.join(output, DIAGNOSTICS_SUBDIR, *parts)
+
+
+# =============================================================================
 # MOVIE LOADING
 # =============================================================================
 
@@ -288,210 +325,65 @@ def _resolve_config(cli_args):
 
 
 # =============================================================================
-# VISUAL-OUTPUT HELPERS (used by per-ROI PNG generator)
-# =============================================================================
-
-def _get_roi_weights(A, roi_idx, dims):
-    """Extract spatial weight map for an ROI."""
-    if hasattr(A, 'toarray'):
-        w = A[:, roi_idx].toarray().flatten()
-    else:
-        w = A[:, roi_idx].flatten()
-    return w.reshape(dims)
-
-
-def _get_roi_centroid(weights):
-    """Return (cy, cx) weighted centroid of footprint."""
-    ys, xs = np.where(weights > 0)
-    if len(ys) == 0:
-        return None
-    cy = float(np.average(ys, weights=weights[ys, xs]))
-    cx = float(np.average(xs, weights=weights[ys, xs]))
-    return cy, cx
-
-
-def _pad_crop(frame, cy, cx, half_size):
-    """Crop a square window around (cy, cx), padding with frame minimum."""
-    H, W = frame.shape
-    size = 2 * half_size
-    out = np.full((size, size), frame.min(), dtype=frame.dtype)
-    src_y0 = int(round(cy)) - half_size
-    src_x0 = int(round(cx)) - half_size
-    dst_y0 = max(0, -src_y0)
-    dst_x0 = max(0, -src_x0)
-    sy0 = max(0, src_y0); sy1 = min(H, src_y0 + size)
-    sx0 = max(0, src_x0); sx1 = min(W, src_x0 + size)
-    h = sy1 - sy0; w = sx1 - sx0
-    if h > 0 and w > 0:
-        out[dst_y0:dst_y0 + h, dst_x0:dst_x0 + w] = frame[sy0:sy1, sx0:sx1]
-    return out
-
-
-def _pad_crop_mask(mask2d, cy, cx, half_size):
-    return _pad_crop(mask2d.astype(np.float32), cy, cx, half_size)
-
-
-def _find_peak_frame(trace, frame_rate):
-    from scipy.signal import find_peaks
-    F0 = np.percentile(trace, 20)
-    scale = np.percentile(trace, 95) - F0 + 1e-10
-    norm = (trace - F0) / scale
-    peaks, _ = find_peaks(norm, height=0.3, distance=int(frame_rate), prominence=0.2)
-    if len(peaks) == 0:
-        return int(np.argmax(trace))
-    return int(peaks[np.argmax(trace[peaks])])
-
-
-def _find_baseline_frame(trace):
-    F0 = np.percentile(trace, 20)
-    thresh = F0 + 0.1 * (trace.max() - F0)
-    quiet = np.where(trace <= thresh)[0]
-    if len(quiet) == 0:
-        return int(np.argmin(trace))
-    mid = len(trace) // 2
-    return int(quiet[np.argmin(np.abs(quiet - mid))])
-
-
-def _compute_dff(trace):
-    F0 = np.percentile(trace, 20)
-    if F0 > 1e-6:
-        return (trace - F0) / F0 * 100, 'ΔF/F (%)'
-    return trace - trace.min(), 'F - F_min'
-
-
-def _generate_per_roi_pngs(
-    A_final, C_final, movie, dims, projections, frame_rate,
-    output_dir,
-):
-    """Generate per-ROI inspection PNGs (peak-frame sequence + trace per ROI)."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as mpl_gridspec
-
-    n_final = A_final.shape[1]
-    inspection_dir = os.path.join(output_dir, 'inspection')
-    os.makedirs(inspection_dir, exist_ok=True)
-
-    # Sort by mean activity (descending) so the highest-signal ROIs come first
-    activity = np.array([np.percentile(C_final[i], 95) - np.percentile(C_final[i], 5)
-                         for i in range(n_final)])
-    sort_idx = np.argsort(activity)[::-1]
-
-    logger.info(f"  Generating {n_final} per-ROI inspection PNGs...")
-
-    image_paths = []
-    T_movie = len(movie)
-
-    for plot_i, roi_idx in enumerate(sort_idx):
-        try:
-            weights = _get_roi_weights(A_final, roi_idx, dims)
-            centroid = _get_roi_centroid(weights)
-            if centroid is None:
-                continue
-
-            cy, cx = centroid
-            w_thresh = max(weights.max() * 0.2, 1e-10)
-            TIGHT = 60
-
-            trace = C_final[roi_idx, :]
-            dff, ylabel = _compute_dff(trace)
-            peak_t = _find_peak_frame(trace, frame_rate)
-            base_t = _find_baseline_frame(trace)
-
-            T_trace = len(trace)
-            peak_f = min(int(peak_t * T_movie / T_trace), T_movie - 1)
-
-            title = f"ROI #{roi_idx}  (Rank {plot_i + 1}/{n_final})"
-
-            fig = plt.figure(figsize=(20, 6), facecolor='#1a1a2e')
-            gs_roi = mpl_gridspec.GridSpec(
-                2, 11, height_ratios=[1, 1.5], hspace=0.4, wspace=0.08)
-            fig.suptitle(title, fontsize=12, fontweight='bold', color='#ccc')
-
-            offsets = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
-            w_tight = _pad_crop_mask(weights, cy, cx, TIGHT)
-
-            sequence_crops = [
-                _pad_crop(movie[max(0, min(T_movie - 1, peak_f + offset))],
-                          cy, cx, TIGHT)
-                for offset in offsets
-            ]
-
-            vlo = np.percentile(sequence_crops, 1)
-            vhi = np.percentile(sequence_crops, 99.5)
-            if vhi <= vlo:
-                vhi = vlo + 1
-
-            for i, (offset, crop) in enumerate(zip(offsets, sequence_crops)):
-                ax = fig.add_subplot(gs_roi[0, i])
-                ax.set_facecolor('#1a1a2e')
-                ax.imshow(crop, cmap='gray', vmin=vlo, vmax=vhi, interpolation='none')
-                ax.contour(w_tight, levels=[w_thresh],
-                           colors=['cyan'], linewidths=1.2, alpha=0.8)
-                if offset == 0:
-                    ax.set_title(f"Peak (t={peak_t / frame_rate:.1f}s)",
-                                 fontsize=10, color='lime', fontweight='bold')
-                    for spine in ax.spines.values():
-                        spine.set_edgecolor('lime'); spine.set_linewidth(2)
-                else:
-                    label = f"+{offset}" if offset > 0 else str(offset)
-                    ax.set_title(f"Peak {label}", fontsize=9, color='#ccc')
-                    for spine in ax.spines.values():
-                        spine.set_edgecolor('#444')
-                ax.axis('off')
-
-            ax_trace = fig.add_subplot(gs_roi[1, :])
-            ax_trace.set_facecolor('#111')
-            t_ax = np.arange(len(dff)) / frame_rate
-            ax_trace.plot(t_ax, dff, color='#4fc3f7', linewidth=1.0)
-            ax_trace.axhline(0, color='#555', linewidth=0.5)
-            ax_trace.axvline(base_t / frame_rate, color='cyan',
-                             linestyle='--', linewidth=1.2, label='Baseline')
-            ax_trace.axvline(peak_t / frame_rate, color='lime',
-                             linestyle='--', linewidth=1.2, label='Peak')
-            win_lo = max(0, (peak_f - 5)) / frame_rate
-            win_hi = min(T_movie - 1, (peak_f + 5)) / frame_rate
-            ax_trace.axvspan(win_lo, win_hi, alpha=0.2, color='lime',
-                             label='Image Sequence Window')
-            ax_trace.set_xlabel('Time (s)', color='#aaa', fontsize=9)
-            ax_trace.set_ylabel(ylabel, color='#aaa', fontsize=9)
-            ax_trace.set_title('Calcium Trace (Processed)',
-                               fontsize=10, color='#ccc')
-            ax_trace.legend(fontsize=8, framealpha=0.3,
-                            labelcolor='white', facecolor='white',
-                            loc='upper right')
-            ax_trace.set_xlim(0, t_ax[-1])
-            ax_trace.grid(True, alpha=0.2, color='#444')
-            ax_trace.tick_params(colors='#aaa')
-            for spine in ax_trace.spines.values():
-                spine.set_edgecolor('#444')
-
-            img_path = os.path.join(inspection_dir, f'roi_{roi_idx:04d}.png')
-            plt.savefig(img_path, dpi=100, bbox_inches='tight', facecolor='white')
-            plt.close()
-            image_paths.append(img_path)
-
-        except Exception as roi_err:
-            logger.warning(f"    ROI #{roi_idx} image failed: {roi_err}")
-            plt.close('all')
-            continue
-
-        if (plot_i + 1) % 50 == 0:
-            logger.info(f"    Generated {plot_i + 1}/{n_final} ROI images")
-
-    logger.info(f"  Generated {len(image_paths)} per-ROI inspection PNGs")
-    return image_paths
-
-
-# =============================================================================
 # MAIN
 # =============================================================================
+
+def _check_environment(args) -> None:
+    """
+    Verify required Python packages are importable before any pipeline work.
+
+    Core packages are always checked.  ``nd2`` is checked only if the input
+    is a Nikon file; ``caiman`` is checked only if motion correction or
+    deconvolution is enabled (both stages depend on it).
+
+    Raises SystemExit with a clear message if anything is missing, pointing
+    the user at ``setup/install.sh``.
+    """
+    import importlib.util
+
+    required = [
+        ('numpy', 'numerical core'),
+        ('scipy', 'signal processing'),
+        ('skimage', 'image processing (scikit-image)'),
+        ('sklearn', 'preprocessing utilities (scikit-learn)'),
+        ('cv2', 'contour extraction (opencv-python)'),
+        ('matplotlib', 'figure generation'),
+        ('tifffile', 'TIFF I/O'),
+        ('yaml', 'config loading (PyYAML)'),
+        ('PIL', 'image utilities (Pillow)'),
+        ('pandas', 'feature tables'),
+        ('statsmodels', 'group-level statistics'),
+        ('joblib', 'auto-radius parallelism'),
+    ]
+    if str(args.movie).lower().endswith('.nd2'):
+        required.append(('nd2', 'Nikon ND2 file reading'))
+    if args.motion_correction or args.deconvolution:
+        why = []
+        if args.motion_correction: why.append('motion correction')
+        if args.deconvolution:     why.append('deconvolution')
+        required.append(('caiman', ' / '.join(why)))
+
+    missing = [(pkg, why) for pkg, why in required
+               if importlib.util.find_spec(pkg) is None]
+
+    if missing:
+        lines = [f"  - {pkg:<14} (needed for: {why})" for pkg, why in missing]
+        msg = (
+            "Missing required Python packages:\n"
+            + "\n".join(lines)
+            + "\n\nInstall everything with:\n"
+            + "    bash setup/install.sh\n"
+            + "and then `conda activate calpipe` before re-running.\n"
+        )
+        raise SystemExit(msg)
+
 
 def main():
     parser = _build_parser()
     cli_args = parser.parse_args()
     args, cfg, config_path = _resolve_config(cli_args)
+
+    _check_environment(args)
 
     from config_loader import get_decay_time_for_indicator
     decay_time = get_decay_time_for_indicator(args.indicator)
@@ -510,6 +402,7 @@ def main():
     logger.info("=" * 70)
 
     os.makedirs(args.output, exist_ok=True)
+    _ensure_output_layout(args.output)
     temp_dir = tempfile.mkdtemp(prefix='calpipe_')
     start_time = datetime.now()
     results = {'config': vars(args)}
@@ -571,7 +464,8 @@ def main():
         logger.info("=" * 70)
 
         if args.motion_correction:
-            from motion_correction import correct_motion, generate_motion_figure
+            from motion_correction import correct_motion
+            from diagnostics import generate_motion_figure
 
             mc_result = correct_motion(
                 movie,
@@ -596,9 +490,9 @@ def main():
             movie_raw = movie
 
             generate_motion_figure(
-                mc_result, os.path.join(args.output, 'motion_correction.png'),
+                mc_result, figure_path(args.output, 'motion_correction.png'),
             )
-            np.save(os.path.join(args.output, 'motion_shifts.npy'), mc_result.shifts)
+            np.save(data_path(args.output, 'motion_shifts.npy'), mc_result.shifts)
 
             logger.info(f"Motion correction applied (mode={mc_result.mode}): "
                         f"max shift ({mc_result.max_shift_y:.1f}, "
@@ -625,7 +519,8 @@ def main():
 
         # Auto-radius estimation
         if args.auto_radius:
-            from auto_radius import optimise_radius, generate_radius_figure
+            from auto_radius import optimise_radius
+            from diagnostics import generate_radius_figure
 
             logger.info("Optimising neuron radius for best trace quality...")
             radius_result = optimise_radius(
@@ -650,7 +545,7 @@ def main():
 
             try:
                 generate_radius_figure(
-                    radius_result, os.path.join(args.output, 'auto_radius.png'),
+                    radius_result, figure_path(args.output, 'auto_radius.png'),
                 )
             except Exception as e:
                 logger.warning(f"Auto-radius figure failed: {e}")
@@ -679,7 +574,7 @@ def main():
             contour_merge_min_overlap=args.contour_merge_min_overlap,
             contour_merge_iou=args.contour_merge_iou,
             contour_merge_max_growth=args.contour_merge_max_growth,
-            diagnostics_dir=os.path.join(args.output, 'diagnostics'),
+            diagnostics_dir=diagnostics_path(args.output),
             precomputed_projections=shared_projections,
         )
 
@@ -692,7 +587,7 @@ def main():
                 movie_smoothed = suppress_hotspots(movie, method='gaussian', sigma=args.smooth_sigma)
                 visualize_hotspot_suppression(
                     movie, movie_smoothed,
-                    os.path.join(args.output, 'diagnostics', 'hotspot_suppression.png'),
+                    diagnostics_path(args.output, 'hotspot_suppression.png'),
                     sigma=args.smooth_sigma, method='gaussian', dpi=150,
                 )
                 del movie_smoothed
@@ -705,9 +600,9 @@ def main():
         # Unsmoothed projections for gallery backgrounds (cheap — no correlation, no smoothing)
         projections_raw = compute_projections(movie, compute_correlation=False, smooth_sigma=0.0)
 
-        np.save(os.path.join(args.output, 'max_projection_raw.npy'), projections_raw.max_proj)
-        np.save(os.path.join(args.output, 'std_projection.npy'), projections_raw.std_proj)
-        np.save(os.path.join(args.output, 'correlation_image.npy'), projections.correlation)
+        np.save(data_path(args.output, 'max_projection_raw.npy'), projections_raw.max_proj)
+        np.save(data_path(args.output, 'std_projection.npy'), projections_raw.std_proj)
+        np.save(data_path(args.output, 'correlation_image.npy'), projections.correlation)
 
         if seeds.n_seeds == 0:
             logger.error("No seeds detected!")
@@ -802,21 +697,21 @@ def main():
         results['dff_correction'] = dff_info
         results['amplitude_method'] = args.amplitude_method
 
-        # Baseline correction diagnostic figure
-        if args.amplitude_method != 'direct':
+        # Baseline correction diagnostic figure (local-background only)
+        if args.amplitude_method == 'local_background':
             try:
-                from preprocessing import generate_dff_diagnostics
-                generate_dff_diagnostics(
+                from diagnostics import generate_local_background_diagnostic
+                generate_local_background_diagnostic(
+                    movie=movie,
+                    A=A_init,
+                    C_raw=C_raw,
                     C_dff=C,
                     dff_info=dff_info,
-                    output_dir=os.path.join(args.output, 'diagnostics'),
-                    method=args.amplitude_method,
+                    output_dir=diagnostics_path(args.output),
                     frame_rate=args.frame_rate,
-                    movie=movie if args.amplitude_method == 'local_background' else None,
-                    A=A_init if args.amplitude_method == 'local_background' else None,
                 )
             except Exception as diag_err:
-                logger.warning(f"DFF diagnostics failed: {diag_err}")
+                logger.warning(f"Local-background diagnostic failed: {diag_err}")
                 import traceback
                 traceback.print_exc()
 
@@ -899,11 +794,11 @@ def main():
                 method=args.deconv_method,
             )
 
-            np.save(os.path.join(args.output, 'spike_trains.npy'),
+            np.save(data_path(args.output, 'spike_trains.npy'),
                     deconv_result['S'])
-            np.save(os.path.join(args.output, 'traces_denoised.npy'),
+            np.save(data_path(args.output, 'traces_denoised.npy'),
                     deconv_result['C_denoised'])
-            np.save(os.path.join(args.output, 'deconv_noise.npy'),
+            np.save(data_path(args.output, 'deconv_noise.npy'),
                     deconv_result['noise'])
 
             results['deconvolution'] = {
@@ -915,10 +810,10 @@ def main():
 
             # Deconvolution diagnostic figure
             try:
-                from deconvolution import generate_deconvolution_figure
+                from diagnostics import generate_deconvolution_figure
                 generate_deconvolution_figure(
                     C_raw_unfilt, deconv_result, args.frame_rate,
-                    os.path.join(args.output, 'deconvolution.png'),
+                    figure_path(args.output, 'deconvolution.png'),
                     C_filtered=C if args.temporal_filter else None,
                 )
             except Exception as fig_err:
@@ -926,7 +821,7 @@ def main():
 
             # Per-ROI presentation trace figures
             try:
-                from deconvolution import save_roi_trace_figures
+                from diagnostics import save_roi_trace_figures
                 save_roi_trace_figures(
                     C_raw_unfilt, deconv_result, args.frame_rate, args.output,
                 )
@@ -935,10 +830,10 @@ def main():
 
             # Decay parameter diagnostics
             try:
-                from deconvolution import generate_decay_diagnostics
+                from diagnostics import generate_decay_diagnostics
                 generate_decay_diagnostics(
                     deconv_result, C_raw_unfilt, args.frame_rate,
-                    decay_time, args.output,
+                    decay_time, figure_path(args.output),
                 )
             except Exception as decay_err:
                 logger.warning(f"Decay diagnostics failed: {decay_err}")
@@ -959,18 +854,18 @@ def main():
         C_final = C
         n_final = A.shape[1]
 
-        save_npz(os.path.join(args.output, 'spatial_footprints.npz'), csc_matrix(A_final))
-        np.save(os.path.join(args.output, 'temporal_traces.npy'), C_final)
+        save_npz(data_path(args.output, 'spatial_footprints.npz'), csc_matrix(A_final))
+        np.save(data_path(args.output, 'temporal_traces.npy'), C_final)
 
         # Projection images (used by group analysis for ROI inspection)
         if hasattr(projections, 'max_proj') and projections.max_proj is not None:
-            np.save(os.path.join(args.output, 'max_projection.npy'), projections.max_proj)
+            np.save(data_path(args.output, 'max_projection.npy'), projections.max_proj)
         if hasattr(projections, 'mean_proj') and projections.mean_proj is not None:
-            np.save(os.path.join(args.output, 'mean_projection.npy'), projections.mean_proj)
+            np.save(data_path(args.output, 'mean_projection.npy'), projections.mean_proj)
 
         # Raw traces for downstream local-ΔF/F amplitude measurement
         if C_raw is not None:
-            np.save(os.path.join(args.output, 'temporal_traces_raw.npy'), C_raw)
+            np.save(data_path(args.output, 'temporal_traces_raw.npy'), C_raw)
 
         results['n_final'] = n_final
 
@@ -996,9 +891,10 @@ def main():
         # 7a. Per-ROI inspection PNGs (off by default, slow)
         if args.per_roi_pngs:
             try:
-                _generate_per_roi_pngs(
+                from diagnostics import generate_per_roi_pngs
+                generate_per_roi_pngs(
                     A_final, C_final, movie, dims, projections,
-                    args.frame_rate, args.output,
+                    args.frame_rate, figure_path(args.output),
                 )
             except Exception as e:
                 logger.warning(f"Per-ROI PNG generation failed: {e}")

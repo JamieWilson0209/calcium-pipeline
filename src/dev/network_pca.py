@@ -242,7 +242,8 @@ def generate_pca_figures(pca_result, pc_spectra, frame_rate, output_dir,
             if i == n_show - 1:
                 ax.set_xlabel('Freq (Hz)')
 
-    path = os.path.join(output_dir, 'network_pca_modes.png')
+    path = os.path.join(output_dir, 'figures', 'network_pca_modes.png')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
     logger.info(f"  PCA modes figure saved: {path}")
@@ -271,7 +272,7 @@ def generate_pca_figures(pca_result, pc_spectra, frame_rate, output_dir,
     ax.set_ylim(0, 105)
 
     plt.tight_layout()
-    path2 = os.path.join(output_dir, 'network_pca_scree.png')
+    path2 = os.path.join(output_dir, 'figures', 'network_pca_scree.png')
     plt.savefig(path2, dpi=150, bbox_inches='tight')
     plt.close()
     logger.info(f"  PCA scree plot saved: {path2}")
@@ -360,7 +361,7 @@ def run_network_pca(movie, frame_rate, output_dir, dataset_name='',
 
     # Step 4: Figures
     logger.info("  Generating figures...")
-    dev_dir = os.path.join(output_dir, 'dev_network')
+    dev_dir = os.path.join(output_dir, 'data', 'dev_network')
     fig_paths = generate_pca_figures(pca_result, pc_spectra, frame_rate,
                                      dev_dir, dataset_name, n_show)
 

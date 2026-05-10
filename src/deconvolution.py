@@ -134,7 +134,7 @@ def deconvolve_traces(
     # OASIS expects small-valued ΔF/F₀ traces (values near 0, transients
     # as positive bumps of ~0.05–0.5).  If traces are raw fluorescence
     # (values in hundreds/thousands/millions), convert them first.
-    C_dff = _ensure_dff(C)
+    C_dff = _ensure_dff(C, frame_rate)
 
     logger.info(f"Deconvolution: method={method}, {N} traces, "
                 f"decay={decay_time}s, frame_rate={frame_rate} Hz")
@@ -161,19 +161,20 @@ def deconvolve_traces(
     return result
 
 
-def _ensure_dff(C: np.ndarray) -> np.ndarray:
+def _ensure_dff(C: np.ndarray, frame_rate: float) -> np.ndarray:
     """
     Ensure traces are ΔF/F₀ for OASIS deconvolution.
 
-    If data is raw fluorescence (median > 1.0): apply per-trace rolling
-    percentile baseline correction and convert to ΔF/F₀.
+    If data is raw fluorescence (median > 1.0): apply the standard
+    rolling-percentile baseline correction (delegates to
+    :func:`preprocessing.compute_dff_traces` so there is one canonical
+    implementation).
 
     If data is already ΔF/F₀ (median ≤ 1.0): pass through without
     modification.  OASIS internally estimates its own baseline (the `bl`
     parameter in constrained_foopsi), so additional baseline subtraction
     here can interfere with its estimation and degrade spike detection.
     """
-    N, T = C.shape
     median_val = np.median(C)
 
     if median_val <= 1.0:
@@ -185,23 +186,18 @@ def _ensure_dff(C: np.ndarray) -> np.ndarray:
     logger.info(f"  Traces appear to be raw fluorescence (median={median_val:.1f}), "
                 f"converting to ΔF/F₀...")
 
-    from scipy.ndimage import percentile_filter
-    window = max(int(T * 0.25), 50)
-    window = min(window, T)
+    try:
+        from preprocessing import compute_dff_traces
+    except ImportError:
+        from .preprocessing import compute_dff_traces
 
-    C_dff = np.zeros_like(C, dtype=np.float64)
-
-    for i in range(N):
-        trace = C[i].astype(np.float64)
-
-        # Rolling percentile baseline
-        baseline = percentile_filter(trace, percentile=8, size=window, mode='reflect')
-        # Floor at 1% of the trace median (not 1e-6) to avoid
-        # division-by-zero artefacts from zero-padded border pixels
-        trace_median = np.median(trace[trace > 0]) if np.any(trace > 0) else 1.0
-        baseline = np.maximum(baseline, max(trace_median * 0.01, 1e-2))
-
-        C_dff[i] = np.clip((trace - baseline) / baseline, -1.0, 100.0)
+    C_dff, _, _ = compute_dff_traces(
+        C, frame_rate=frame_rate,
+        percentile=8.0,
+        window_fraction=0.25,
+        min_window=50, max_window=500,
+        edge_trim=False,
+    )
 
     logger.info(f"  Converted: range [{C_dff.min():.4f}, {C_dff.max():.4f}], "
                 f"median={np.median(C_dff):.4f}")
@@ -326,27 +322,51 @@ def _deconvolve_oasis(
                     f"removed {n_noise_rejected} sub-threshold spikes")
 
     # ── Transient duration gate ────────────────────────────────────────────
-    # Reject traces where the longest continuous run of spike frames
-    # exceeds max_transient_seconds.  Genuine calcium transients decay
-    # within a few seconds (fitted τ ≈ 2s median); sustained events
-    # lasting 80+ seconds indicate loading artefacts, slow baseline
-    # shifts, or non-neuronal signals that OASIS has fitted as activity.
+    # Reject traces where any single elevated episode on the *denoised*
+    # trace lasts longer than max_transient_seconds.  Genuine calcium
+    # transients decay within a few seconds (fitted τ ≈ 2s median); a
+    # single sustained elevation lasting 80+ seconds indicates loading
+    # artefacts, slow baseline shifts, or non-neuronal signals that OASIS
+    # has fitted as activity rather than baseline.
+    #
+    # We measure the duration of "elevated" episodes on C_denoised,
+    # defined as samples where the denoised trace exceeds the OASIS
+    # baseline by more than a small per-trace tolerance.  The tolerance
+    # is the larger of (a) 5% of the trace's peak-above-baseline (so
+    # bright cells aren't false-positived by tiny baseline noise) and
+    # (b) an absolute floor of 0.01 ΔF/F₀ (so dim cells aren't
+    # over-sensitive to numerical noise from the OASIS solver).
+    #
+    # Closely-spaced genuine transients each resolve back to baseline
+    # between events at this tolerance — bursts and rhythmic firing
+    # are correctly seen as a series of short episodes, not one long one.
     max_transient_seconds = 80.0
     max_transient_frames = int(max_transient_seconds * frame_rate)
     n_duration_rejected = 0
     for i in range(N):
-        if np.sum(S[i] > 0) == 0:
+        denoised = C_denoised[i].astype(np.float32)
+        bl = float(baselines[i])
+        peak_above_bl = float(np.max(denoised) - bl)
+        if peak_above_bl <= 0:
+            continue   # flat or sub-baseline trace, nothing to gate
+
+        tolerance = max(0.05 * peak_above_bl, 0.01)
+        elevated = denoised > (bl + tolerance)
+        if not elevated.any():
             continue
-        spike_binary = (S[i] > 0).astype(np.int32)
-        diffs = np.diff(np.concatenate([[0], spike_binary, [0]]))
+
+        # Longest continuous run of elevated frames.
+        diffs = np.diff(np.concatenate([[0], elevated.astype(np.int8), [0]]))
         starts = np.where(diffs == 1)[0]
         ends = np.where(diffs == -1)[0]
-        if len(starts) > 0:
-            longest_run = int(np.max(ends - starts))
-            if longest_run > max_transient_frames:
-                C_denoised[i, :] = 0.0
-                S[i, :] = 0.0
-                n_duration_rejected += 1
+        if len(starts) == 0:
+            continue
+        longest_run = int(np.max(ends - starts))
+
+        if longest_run > max_transient_frames:
+            C_denoised[i, :] = 0.0
+            S[i, :] = 0.0
+            n_duration_rejected += 1
 
     if n_duration_rejected > 0:
         logger.info(f"  Duration gate (>{max_transient_seconds:.0f}s): "
@@ -449,370 +469,3 @@ def _mad_noise(trace):
     """MAD-based noise estimate."""
     diff = np.diff(trace)
     return 1.4826 * np.median(np.abs(diff - np.median(diff))) / np.sqrt(2)
-
-
-# =============================================================================
-# DIAGNOSTIC FIGURE
-# =============================================================================
-
-def save_roi_trace_figures(
-    C: np.ndarray,
-    deconv_result: Dict,
-    frame_rate: float,
-    output_dir: str,
-    n_rois: int = 20,
-    dpi: int = 150,
-) -> str:
-    """
-    Save one presentation-quality figure per ROI showing the raw ΔF/F₀
-    trace (top panel) and the OASIS deconvolved trace with spike markers
-    (bottom panel).
-
-    ROIs are selected automatically: the top ``n_rois`` by SNR among those
-    with at least one detected spike, so every saved figure is informative.
-
-    Parameters
-    ----------
-    C : array (N, T)
-        ΔF/F₀ traces passed into deconvolution (or raw fluorescence — the
-        function uses ``deconv_result['C_dff']`` if available, falling back
-        to C).
-    deconv_result : dict
-        Output of ``deconvolve_traces``.
-    frame_rate : float
-        Sampling rate in Hz — used to label the time axis.
-    output_dir : str
-        Parent output directory.  Figures are written to
-        ``<output_dir>/figures/roi_traces/``.
-    n_rois : int
-        Number of ROIs to save (default 20).
-    dpi : int
-        Figure resolution (default 150).
-
-    Returns
-    -------
-    str  Path to the roi_traces directory.
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    S      = deconv_result['S']
-    C_den  = deconv_result['C_denoised']
-    n_spikes = deconv_result['n_spikes']
-    C_raw  = deconv_result.get('C_dff', C)   # prefer the ΔF/F₀ that OASIS saw
-
-    N, T = C_raw.shape
-    t_ax = np.arange(T) / frame_rate
-
-    # ── Select ROIs: top n_rois by SNR among those with spikes ──────────
-    snr = np.zeros(N)
-    for i in range(N):
-        noise = _mad_noise(C_raw[i])
-        if noise > 0:
-            snr[i] = (np.percentile(C_raw[i], 95) - np.percentile(C_raw[i], 5)) / noise
-
-    active_idx = np.where(n_spikes > 0)[0]
-    if len(active_idx) == 0:
-        logger.warning("  No ROIs with detected spikes — skipping ROI trace figures")
-        return output_dir
-
-    selected = active_idx[np.argsort(snr[active_idx])[::-1]][:n_rois]
-
-    traces_dir = os.path.join(output_dir, 'figures', 'roi_traces')
-    os.makedirs(traces_dir, exist_ok=True)
-
-    for rank, roi_idx in enumerate(selected):
-        raw   = C_raw[roi_idx]
-        den   = C_den[roi_idx]
-        spike_frames = np.where(S[roi_idx] > 0)[0]
-
-        fig, (ax_raw, ax_den) = plt.subplots(
-            2, 1, figsize=(14, 4),
-            sharex=True,
-            gridspec_kw={'hspace': 0.08},
-        )
-
-        # ── Top: raw ΔF/F₀ ───────────────────────────────────────────
-        ax_raw.plot(t_ax, raw, color='#aaaaaa', linewidth=0.8, zorder=2)
-        ax_raw.set_ylabel('ΔF/F₀', fontsize=10)
-        ax_raw.set_xlim(t_ax[0], t_ax[-1])
-        ax_raw.spines[['top', 'right']].set_visible(False)
-        ax_raw.tick_params(axis='x', labelbottom=False)
-
-        # ── Bottom: deconvolved trace + spike markers ────────────────
-        ax_den.plot(t_ax, den, color='#2196F3', linewidth=1.2, zorder=2,
-                    label='Deconvolved')
-        if len(spike_frames) > 0:
-            spike_times = spike_frames / frame_rate
-            ax_den.vlines(spike_times,
-                          ymin=0, ymax=den[spike_frames],
-                          color='#F44336', linewidth=1.2,
-                          zorder=3, label='Spikes')
-            ax_den.scatter(spike_times, den[spike_frames],
-                           color='#F44336', s=18, zorder=4)
-
-        ax_den.axhline(0, color='#555555', linewidth=0.5, linestyle='--')
-        ax_den.set_ylabel('Deconvolved', fontsize=10)
-        ax_den.set_xlabel('Time (s)', fontsize=10)
-        ax_den.set_xlim(t_ax[0], t_ax[-1])
-        ax_den.spines[['top', 'right']].set_visible(False)
-
-        fig.suptitle(
-            f'ROI {roi_idx}   |   SNR {snr[roi_idx]:.1f}   |   '
-            f'{n_spikes[roi_idx]} spikes   |   s_min = 0.1 ΔF/F₀',
-            fontsize=11, fontweight='bold', y=1.01,
-        )
-
-        fname = os.path.join(traces_dir, f'roi_{roi_idx:04d}_rank{rank+1:03d}.png')
-        fig.savefig(fname, dpi=dpi, bbox_inches='tight')
-        plt.close(fig)
-
-    logger.info(f"  Saved {len(selected)} ROI trace figures → {traces_dir}/")
-    return traces_dir
-
-
-def generate_deconvolution_figure(
-    C: np.ndarray,
-    deconv_result: Dict,
-    frame_rate: float,
-    output_path: str,
-    n_examples: int = 8,
-    C_filtered: Optional[np.ndarray] = None,
-) -> str:
-    """Generate diagnostic figure showing deconvolution results."""
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    S = deconv_result['S']
-    C_den = deconv_result['C_denoised']
-    n_spikes = deconv_result['n_spikes']
-
-    # Use the ΔF/F₀ version for display if available
-    C_plot = deconv_result.get('C_dff', C)
-
-    N, T = C_plot.shape
-    t_ax = np.arange(T) / frame_rate
-
-    # Pick examples: prioritise neurons WITH detected spikes, sorted by SNR.
-    # Show a mix of active neurons (to verify detection quality) and
-    # at most 2 inactive ones (to verify they're correctly silent).
-    snr = np.zeros(N)
-    for i in range(N):
-        noise = _mad_noise(C_plot[i])
-        if noise > 0:
-            snr[i] = (np.percentile(C_plot[i], 95) - np.percentile(C_plot[i], 5)) / noise
-
-    has_spikes = n_spikes > 0
-    active_idx = np.where(has_spikes)[0]
-    inactive_idx = np.where(~has_spikes)[0]
-
-    # Sort each group by SNR descending
-    active_sorted = active_idx[np.argsort(snr[active_idx])[::-1]] if len(active_idx) > 0 else np.array([], dtype=int)
-    inactive_sorted = inactive_idx[np.argsort(snr[inactive_idx])[::-1]] if len(inactive_idx) > 0 else np.array([], dtype=int)
-
-    # Take up to (n_examples - 2) active, then fill with up to 2 inactive
-    n_active_show = min(len(active_sorted), max(n_examples - 2, n_examples))
-    n_inactive_show = min(len(inactive_sorted), max(0, n_examples - n_active_show))
-    examples = np.concatenate([active_sorted[:n_active_show], inactive_sorted[:n_inactive_show]]).astype(int)
-    examples = examples[:n_examples]
-
-    fig, axes = plt.subplots(n_examples, 1, figsize=(16, n_examples * 2.2),
-                             sharex=True)
-    if n_examples == 1:
-        axes = [axes]
-
-    for ax, idx in zip(axes, examples):
-        # Raw ΔF/F₀ trace
-        ax.plot(t_ax, C_plot[idx], color='#888', alpha=0.4, linewidth=0.5,
-                label='ΔF/F₀')
-
-        # Denoised trace
-        ax.plot(t_ax, C_den[idx], color='#00e676', linewidth=1.2,
-                label='Denoised')
-
-        # Spike times
-        spike_frames = np.where(S[idx] > 0)[0]
-        if len(spike_frames) > 0:
-            spike_times = spike_frames / frame_rate
-            ax.scatter(spike_times, C_den[idx, spike_frames],
-                       color='red', s=15, zorder=5, label='Spikes')
-
-        ax.set_ylabel(f'ROI {idx}', fontsize=8)
-        ax.grid(alpha=0.2)
-        ax.tick_params(labelsize=7)
-
-        info = f'SNR={snr[idx]:.1f}, {n_spikes[idx]} spikes'
-        ax.text(0.99, 0.95, info, transform=ax.transAxes, fontsize=7,
-                ha='right', va='top',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-
-    axes[0].legend(fontsize=8, ncol=4, loc='upper left')
-    axes[-1].set_xlabel('Time (s)')
-
-    method = deconv_result['method']
-    total = int(n_spikes.sum())
-    median = float(np.median(n_spikes))
-    fig.suptitle(f'Deconvolution ({method}) — {total} total spikes, '
-                 f'median {median:.0f}/neuron',
-                 fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    return output_path
-
-
-def generate_decay_diagnostics(
-    deconv_result: Dict,
-    C_dff: np.ndarray,
-    frame_rate: float,
-    decay_time_initial: float,
-    output_dir: str,
-):
-    """
-    Generate diagnostic figure for deconvolution decay parameters.
-
-    Produces decay_diagnostics.png with 6 panels:
-      A — Histogram of fitted g values vs initial g
-      B — Histogram of implied tau values vs initial tau
-      C — Per-ROI scatter of fitted tau vs trace SNR
-      D–F — Example transient overlays (fastest / median / slowest decay)
-
-    Parameters
-    ----------
-    deconv_result : dict
-        Output from deconvolve_traces()
-    C_dff : np.ndarray (N, T)
-        Input ΔF/F₀ traces
-    frame_rate, decay_time_initial : float
-    output_dir : str
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import os
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    N, T = C_dff.shape
-    dt = 1.0 / frame_rate
-    g_init = np.exp(-dt / decay_time_initial)
-
-    g_fitted = deconv_result['g'][:, 0]
-    g_valid = g_fitted[g_fitted > 0]
-
-    if len(g_valid) == 0:
-        logger.warning("No valid g values — skipping decay diagnostics")
-        return None
-
-    tau_fitted = -dt / np.log(np.clip(g_valid, 1e-10, 1 - 1e-10))
-    tau_all = -dt / np.log(np.clip(g_fitted, 1e-10, 1 - 1e-10))
-    tau_cap = np.percentile(tau_fitted, 99)
-
-    C_den = deconv_result['C_denoised']
-    S = deconv_result['S']
-    noise = deconv_result['noise']
-
-    # SNR per ROI
-    snr = np.zeros(N)
-    for i in range(N):
-        n = noise[i]
-        if n > 1e-10:
-            snr[i] = (np.percentile(C_dff[i], 95) - np.percentile(C_dff[i], 5)) / n
-
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle('Deconvolution decay parameter diagnostics', fontsize=20,
-                 fontweight='bold')
-
-    # ── A: g histogram ───────────────────────────────────────────────────
-    ax = axes[0, 0]
-    ax.hist(g_valid, bins=50, color='#4472C4', alpha=0.7, edgecolor='white')
-    ax.axvline(g_init, color='red', linestyle='--', linewidth=2,
-               label=f'Initial g = {g_init:.4f}\n(τ = {decay_time_initial}s)')
-    ax.axvline(np.median(g_valid), color='orange', linewidth=2,
-               label=f'Median fitted = {np.median(g_valid):.4f}')
-    ax.set_xlabel('Fitted g (AR1 coefficient)', fontsize=18)
-    ax.set_ylabel('Count', fontsize=18)
-    ax.set_title('A — Fitted decay coefficient', fontsize=24, fontweight='bold')
-    ax.legend(fontsize=18, loc='upper right')
-    ax.tick_params(labelsize=18)
-
-    # ── B: tau histogram ─────────────────────────────────────────────────
-    ax = axes[0, 1]
-    tau_clip = np.clip(tau_fitted, 0, tau_cap)
-    ax.hist(tau_clip, bins=50, color='#ED7D31', alpha=0.7, edgecolor='white')
-    ax.axvline(decay_time_initial, color='red', linestyle='--', linewidth=2,
-               label=f'Initial τ = {decay_time_initial}s')
-    ax.axvline(np.median(tau_fitted), color='blue', linewidth=2,
-               label=f'Median fitted = {np.median(tau_fitted):.2f}s')
-    ax.set_xlabel('Implied decay time τ (seconds)', fontsize=18)
-    ax.set_ylabel('Count', fontsize=18)
-    ax.set_title('B — Implied decay time', fontsize=24, fontweight='bold')
-    ax.legend(fontsize=18, loc='upper right')
-    ax.tick_params(labelsize=18)
-
-    # ── C: tau vs SNR ────────────────────────────────────────────────────
-    ax = axes[0, 2]
-    valid = g_fitted > 0
-    tau_plot = np.clip(tau_all, 0, tau_cap)
-    ax.scatter(snr[valid], tau_plot[valid], s=15, alpha=0.4, c='#4472C4')
-    ax.axhline(decay_time_initial, color='red', linestyle='--', alpha=0.7,
-               label=f'Initial τ = {decay_time_initial}s')
-    ax.axhline(np.median(tau_fitted), color='orange', linestyle='-', alpha=0.7,
-               label=f'Median fitted = {np.median(tau_fitted):.2f}s')
-    ax.set_xlabel('Trace SNR (p95−p5 / noise)', fontsize=18)
-    ax.set_ylabel('Fitted τ (s)', fontsize=18)
-    ax.set_title('C — Decay time vs trace quality', fontsize=24, fontweight='bold')
-    ax.legend(fontsize=18, loc='upper right')
-    ax.tick_params(labelsize=18)
-
-    # ── D–F: Example transients ──────────────────────────────────────────
-    n_spikes_per = np.array([int(np.sum(S[i] > 0)) for i in range(N)])
-    active = np.where((n_spikes_per >= 3) & (g_fitted > 0))[0]
-    t_ax = np.arange(T) / frame_rate
-
-    if len(active) >= 3:
-        tau_active = tau_all[active]
-        order = np.argsort(tau_active)
-        examples = [active[order[0]],
-                    active[order[len(order) // 2]],
-                    active[order[-1]]]
-        labels = ['D — Fastest decay', 'E — Median decay', 'F — Slowest decay']
-    elif len(active) > 0:
-        examples = list(active[:min(3, len(active))])
-        labels = [f'{chr(68+j)} — Example' for j in range(len(examples))]
-    else:
-        examples, labels = [], []
-
-    for j, (roi, label) in enumerate(zip(examples, labels)):
-        ax = axes[1, j]
-        ax.plot(t_ax, C_dff[roi], color='#aaa', alpha=0.4, linewidth=0.5,
-                label='Raw ΔF/F₀')
-        ax.plot(t_ax, C_den[roi], color='#00c853', linewidth=1.2,
-                label='OASIS denoised')
-
-        spk = np.where(S[roi] > 0)[0]
-        if len(spk) > 0:
-            ax.scatter(spk / frame_rate, C_den[roi, spk],
-                       color='red', s=25, zorder=5, label='Events')
-
-        g_r = g_fitted[roi]
-        tau_r = tau_all[roi]
-        ax.set_title(f'{label}',
-                     fontsize=24, fontweight='bold')
-        ax.set_xlabel('Time (s)', fontsize=18)
-        ax.set_ylabel('ΔF/F₀', fontsize=18)
-        ax.legend(fontsize=18, loc='upper right')
-        ax.tick_params(labelsize=18)
-        ax.grid(alpha=0.15)
-
-    for j in range(len(examples), 3):
-        axes[1, j].axis('off')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    path = os.path.join(output_dir, 'decay_diagnostics.png')
-    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close()
-    logger.info(f"  Saved decay diagnostics: {path}")
-    return path

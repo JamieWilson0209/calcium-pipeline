@@ -7,17 +7,18 @@ Detection pipeline:
   2. LoG blob detection on each projection
   3. Duplicate merging across projections
   4. Per-blob Otsu contour extraction from peak-activity frames
-  5. Confidence scoring and boundary filtering
+  5. Boundary filtering (drop ROIs touching the FOV edge)
 
 Contour extraction strategy
 ----------------------------
 For each blob candidate the module identifies the frames in which that
-specific neuron is most active (top-N by mean intensity within the blob
-radius) and builds a local max-projection from those frames only.  Otsu
-thresholding is then applied to the locality-masked ROI.  This
-activity-gated projection suppresses bright neighbouring cells and
-calcium hotspots that would otherwise dominate a global max projection,
-giving reliable contour boundaries even in dense organoid fields.
+specific neuron is most active (top-N by mean intensity within a padded
+ROI window around the blob — see ``_extract_contour_for_blob``) and
+builds a local max-projection from those frames only.  Otsu thresholding
+is then applied to the locality-masked ROI.  This activity-gated
+projection suppresses bright neighbouring cells and calcium hotspots
+that would otherwise dominate a global max projection, giving reliable
+contour boundaries even in dense organoid fields.
 
 Spatial footprints
 -------------------
@@ -82,7 +83,6 @@ class ContourSeedResult:
     centers: np.ndarray           # (N, 2)  (row, col)
     radii: np.ndarray             # (N,)
     intensities: np.ndarray       # (N,)
-    confidence: np.ndarray        # (N,)  0–1
     source_projection: np.ndarray # (N,)  string codes
 
     # Contour data
@@ -115,7 +115,6 @@ class ContourSeedResult:
             'centers': self.centers.tolist(),
             'radii': self.radii.tolist(),
             'intensities': self.intensities.tolist(),
-            'confidence': self.confidence.tolist(),
             'n_seeds': self.n_seeds,
             'n_contours': self.n_contours,
             'contour_success_rate': self.contour_success_rate,
@@ -861,8 +860,8 @@ def extract_contour(
     --------
     1. Define a padded ROI around the blob (2× radius + padding on each side).
     2. Identify peak-activity frames: frames where mean intensity inside the
-       blob radius exceeds ``peak_percentile``, or the top ``n_peak_frames``
-       frames if fewer qualify.
+       padded ROI window exceeds ``peak_percentile``, or the top
+       ``n_peak_frames`` frames if fewer qualify.
     3. Build a local max-projection from those peak frames.
     4. Apply ``smooth_sigma`` Gaussian smoothing to suppress hotspots.
     5. Apply a Gaussian locality mask to down-weight distant pixels.
@@ -1201,7 +1200,7 @@ def detect_seeds_with_contours(
         logger.warning("No blobs detected — returning empty result")
         return ContourSeedResult(
             centers=np.empty((0, 2)), radii=np.array([]),
-            intensities=np.array([]), confidence=np.array([]),
+            intensities=np.array([]),
             contours=[], contour_success=np.array([], dtype=bool),
             source_projection=np.array([], dtype='U10'),
             diagnostics=master_diag,
@@ -1360,26 +1359,6 @@ def detect_seeds_with_contours(
     per_blob_diagnostics = [d for d, k in zip(per_blob_diagnostics, keep) if k]
     n_seeds = int(keep.sum())
 
-    # ── Confidence scores ────────────────────────────────────────────────────
-    int_lo, int_hi = intensities.min(), intensities.max()
-    intensity_score = (
-        (intensities - int_lo) / (int_hi - int_lo)
-        if int_hi > int_lo else np.full(n_seeds, 0.5)
-    )
-    contour_boost = np.where(contour_success_arr, 1.0, 0.7)
-    source_boost  = np.where(sources == 'max', 1.0, 0.9)
-
-    contour_quality = np.full(n_seeds, 0.5)
-    for i, (ci, ok) in enumerate(zip(contours, contour_success_arr)):
-        if ok and ci is not None:
-            contour_quality[i] = (ci.circularity + ci.solidity) / 2
-
-    confidence = np.clip(
-        intensity_score * 0.4 + contour_quality * 0.3 +
-        contour_boost * 0.2 + source_boost * 0.1,
-        0, 1,
-    )
-
     total_time = time.time() - t0
     master_diag['timing']['total'] = total_time
     master_diag['n_seeds_final'] = n_seeds
@@ -1406,7 +1385,6 @@ def detect_seeds_with_contours(
         centers=centers,
         radii=radii,
         intensities=intensities,
-        confidence=confidence,
         contours=contours,
         contour_success=contour_success_arr,
         source_projection=sources,

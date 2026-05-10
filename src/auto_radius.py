@@ -32,10 +32,13 @@ toward larger ROIs.
 Parallelisation
 ---------------
 Candidates are independent — they share only read-only inputs (movie,
-projections) — so they map cleanly onto a joblib worker pool.  The same
-code runs on Eddie (fork, multi-core SGE job) and locally (spawn on Mac,
-fork on Linux) without modification.  Pool size is capped at the number
-of available cores so the job respects its SGE allocation.
+projections) — so they run in parallel via joblib with
+``prefer='threads'``.  Threads work because the heavy lifting inside
+each candidate (numpy / scipy / skimage / cv2) releases the GIL.  Pool
+size is ``min(n_candidates, os.cpu_count())`` so SGE-allocated cores
+aren't oversubscribed and idle workers aren't created if there are
+fewer candidates than cores.  Falls back to sequential evaluation if
+joblib is not installed.
 """
 
 import logging
@@ -138,9 +141,11 @@ def _generate_candidates(
     n_candidates: int,
 ) -> List[Tuple[float, float]]:
     """
-    Generate evenly spaced (min_radius, max_radius) candidate pairs across
-    the sweep range.  Each candidate uses max_radius = 2× min_radius.
-    Duplicates are removed.
+    Generate (min_radius, max_radius) candidate pairs by walking centers
+    evenly across the sweep range.  Each candidate brackets its center
+    with [c·0.5, c·2.0] (so the unclamped ratio is 4×), then clamps to
+    the requested ``radius_range``.  Duplicates after clamping are
+    removed.
     """
     r_min, r_max = radius_range
     centers = np.linspace(r_min * 1.5, r_max * 0.7, n_candidates)
@@ -269,84 +274,3 @@ def optimise_radius(
         ],
         'all_results': results,
     }
-
-
-# =============================================================================
-# DIAGNOSTIC FIGURE
-# =============================================================================
-
-def generate_radius_figure(
-    radius_result: Dict,
-    output_path: str,
-) -> str:
-    """
-    Save a 2-panel diagnostic figure for the radius optimisation sweep.
-
-    Panel A — median Otsu inter-class variance per candidate (scoring metric)
-    Panel B — variance distributions per candidate (CDF)
-    """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    results  = radius_result['all_results']
-    best_idx = next(
-        i for i, r in enumerate(results)
-        if r['min_radius'] == radius_result['best_min_radius']
-        and r['max_radius'] == radius_result['best_max_radius']
-    )
-
-    x      = np.arange(len(results))
-    labels = [f"[{r['min_radius']:.0f},{r['max_radius']:.0f}]" for r in results]
-
-    BEST_COLOUR = '#e94560'
-    BASE_COLOUR = 'steelblue'
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, panel in zip(axes, ['A', 'B']):
-        ax.text(-0.1, 1.05, panel, transform=ax.transAxes,
-                fontsize=24, fontweight='bold', va='top', ha='right')
-
-    # Panel A: Median inter-class variance per candidate
-    ax = axes[0]
-    colours = [BEST_COLOUR if i == best_idx else BASE_COLOUR
-               for i in range(len(results))]
-    ax.bar(x, [r['median_variance'] for r in results],
-           color=colours, edgecolor='black', alpha=0.8)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=30, fontsize=11)
-    ax.set_xlabel('Radius range [min, max] (px)')
-    ax.set_ylabel('Median Otsu inter-class variance', fontsize=12)
-    ax.set_title('Otsu Separation by Radius', fontsize=14)
-
-    # Panel B: Variance CDFs
-    ax = axes[1]
-    for i, res in enumerate(results):
-        variances = res['variances']
-        if not variances:
-            continue
-        sorted_v = np.sort(variances)
-        cdf = np.arange(1, len(sorted_v) + 1) / len(sorted_v)
-        ax.plot(sorted_v, cdf,
-                color=BEST_COLOUR if i == best_idx else BASE_COLOUR,
-                alpha=0.9 if i == best_idx else 0.4,
-                linewidth=2 if i == best_idx else 1,
-                label=labels[i])
-    ax.set_xlabel('Otsu inter-class variance', fontsize=12)
-    ax.set_ylabel('Cumulative fraction', fontsize=12)
-    ax.set_title('Variance Distributions', fontsize=14)
-    ax.set_xlim(left=0)
-    ax.legend(fontsize=10, loc='lower right')
-
-    best = results[best_idx]
-    fig.suptitle(
-        f"Auto-Radius — Best: [{best['min_radius']:.0f}, {best['max_radius']:.0f}] px  "
-        f"median variance={best['median_variance']:.1f}  "
-        f"n_contours={best['n_contours']}",
-        fontsize=13, fontweight='bold',
-    )
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
-    return output_path

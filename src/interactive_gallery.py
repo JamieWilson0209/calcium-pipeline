@@ -9,7 +9,7 @@ Features:
 - Toggle overlay options (contours, seed circles, ROI labels)
 - Click on any ROI to see detailed diagnostics
 - Zoom and pan controls
-- Filter ROIs by confidence, size, circularity
+- Filter ROIs by size, circularity
 
 Author: Calcium Pipeline
 """
@@ -150,7 +150,6 @@ def generate_roi_diagnostic_data(
             'id': i,
             'center': [float(y), float(x)],
             'radius': float(r),
-            'confidence': float(seeds.confidence[i]),
             'intensity': float(seeds.intensities[i]),
             'has_contour': bool(seeds.contour_success[i]),
             'contour_points': contour_points,
@@ -256,7 +255,6 @@ def generate_interactive_gallery(
         'with_contours': int(seeds.contour_success.sum()),
         'fallback': int((~seeds.contour_success).sum()),
         'median_radius': float(np.median(seeds.radii)),
-        'median_confidence': float(np.median(seeds.confidence)),
         'radius_range': [float(seeds.radii.min()), float(seeds.radii.max())],
     }
     
@@ -583,7 +581,7 @@ def generate_interactive_gallery(
             font-weight: bold;
         }}
         
-        .roi-list-item .roi-conf {{
+        .roi-list-item .roi-meta {{
             font-size: 12px;
             color: #aaa;
         }}
@@ -667,10 +665,6 @@ def generate_interactive_gallery(
             <div class="control-group">
                 <h3>Filters</h3>
                 <div class="slider-container">
-                    <label>Min Confidence: <span class="slider-value" id="conf-value">0.00</span></label>
-                    <input type="range" id="min-confidence" min="0" max="1" step="0.05" value="0">
-                </div>
-                <div class="slider-container">
                     <label>Min Radius: <span class="slider-value" id="radius-value">0</span>px</label>
                     <input type="range" id="min-radius" min="0" max="50" step="1" value="0">
                 </div>
@@ -694,10 +688,6 @@ def generate_interactive_gallery(
                     <div class="stat-row">
                         <span>Median Radius:</span>
                         <span class="stat-value">{stats['median_radius']:.1f}px</span>
-                    </div>
-                    <div class="stat-row">
-                        <span>Median Confidence:</span>
-                        <span class="stat-value">{stats['median_confidence']:.2f}</span>
                     </div>
                     <div class="stat-row">
                         <span>Visible ROIs:</span>
@@ -739,10 +729,6 @@ def generate_interactive_gallery(
                 </div>
                 
                 <div class="detail-grid">
-                    <div class="detail-item">
-                        <div class="label">Confidence</div>
-                        <div class="value" id="detail-confidence">0.00</div>
-                    </div>
                     <div class="detail-item">
                         <div class="label">Radius</div>
                         <div class="value" id="detail-radius">0px</div>
@@ -816,7 +802,6 @@ def generate_interactive_gallery(
         let showLabels = false;
         let showFallback = true;
         let showEdgeRois = true;
-        let minConfidence = 0;
         let minRadius = 0;
         
         // Canvas setup
@@ -868,7 +853,6 @@ def generate_interactive_gallery(
         
         function getVisibleRois() {{
             return roiData.filter(roi => {{
-                if (roi.confidence < minConfidence) return false;
                 if (roi.radius < minRadius) return false;
                 if (!showFallback && !roi.has_contour) return false;
                 if (!showEdgeRois && roi.boundary_touching) return false;
@@ -1017,7 +1001,6 @@ def generate_interactive_gallery(
                     badge.className = 'roi-badge boundary';
                 }}
                 
-                document.getElementById('detail-confidence').textContent = roi.confidence.toFixed(3);
                 document.getElementById('detail-radius').textContent = roi.radius.toFixed(1) + 'px';
                 document.getElementById('detail-circularity').textContent = 
                     roi.circularity ? roi.circularity.toFixed(3) : 'N/A';
@@ -1205,7 +1188,7 @@ def generate_interactive_gallery(
                 item.dataset.id = roi.id;
                 item.innerHTML = `
                     <span class="roi-num">#${{roi.id}}</span>
-                    <span class="roi-conf">${{roi.confidence.toFixed(2)}} | ${{roi.radius.toFixed(0)}}px</span>
+                    <span class="roi-meta">${{roi.radius.toFixed(0)}}px</span>
                 `;
                 item.onclick = () => selectRoi(roi);
                 list.appendChild(item);
@@ -1260,12 +1243,6 @@ def generate_interactive_gallery(
         
         document.getElementById('show-edge-rois').addEventListener('change', (e) => {{
             showEdgeRois = e.target.checked;
-            render();
-        }});
-        
-        document.getElementById('min-confidence').addEventListener('input', (e) => {{
-            minConfidence = parseFloat(e.target.value);
-            document.getElementById('conf-value').textContent = minConfidence.toFixed(2);
             render();
         }});
         
@@ -1328,7 +1305,7 @@ def generate_interactive_gallery(
                 const tooltip = document.getElementById('tooltip');
                 
                 if (roi) {{
-                    tooltip.innerHTML = `ROI #${{roi.id}}<br>Conf: ${{roi.confidence.toFixed(2)}}<br>R: ${{roi.radius.toFixed(1)}}px`;
+                    tooltip.innerHTML = `ROI #${{roi.id}}<br>R: ${{roi.radius.toFixed(1)}}px`;
                     tooltip.style.left = (e.clientX + 15) + 'px';
                     tooltip.style.top = (e.clientY + 15) + 'px';
                     tooltip.classList.add('visible');

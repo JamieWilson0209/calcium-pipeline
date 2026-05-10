@@ -244,9 +244,8 @@ def _fig_raster_plots_split(datasets, labels, colors, raster_dir, per_dataset_di
     
     for i, ds in enumerate(datasets):
         result_path = Path(ds.filepath)
-        spikes_path = result_path / 'spike_trains.npy'
-        denoised_path = result_path / 'traces_denoised.npy'
-        conf_path = result_path / 'confidence_scores.npy'
+        spikes_path = result_path / 'data' / 'spike_trains.npy'
+        denoised_path = result_path / 'data' / 'traces_denoised.npy'
         
         if not spikes_path.exists():
             continue
@@ -262,8 +261,7 @@ def _fig_raster_plots_split(datasets, labels, colors, raster_dir, per_dataset_di
         if valid is not None and len(valid) == S_all.shape[0]:
             valid_idx = np.where(valid)[0]
         else:
-            conf = np.load(conf_path) if conf_path.exists() else np.ones(S_all.shape[0])
-            valid_idx = np.where(conf >= 0.5)[0]
+            valid_idx = np.arange(S_all.shape[0])
         
         S = S_all[valid_idx]
         N, T = S.shape
@@ -276,7 +274,7 @@ def _fig_raster_plots_split(datasets, labels, colors, raster_dir, per_dataset_di
         if denoised_path.exists():
             C_all = np.load(denoised_path)
             C_den = C_all[valid_idx]
-        raw_path = result_path / 'temporal_traces.npy'
+        raw_path = result_path / 'data' / 'temporal_traces.npy'
         if raw_path.exists():
             C_raw_valid = np.load(raw_path)[valid_idx]
         
@@ -391,9 +389,8 @@ def _fig_correlation_matrices_split(datasets, labels, colors, corr_dir, per_data
         result_path = Path(ds.filepath)
         
         # Prefer denoised
-        denoised_path = result_path / 'traces_denoised.npy'
-        raw_path = result_path / 'temporal_traces.npy'
-        conf_path = result_path / 'confidence_scores.npy'
+        denoised_path = result_path / 'data' / 'traces_denoised.npy'
+        raw_path = result_path / 'data' / 'temporal_traces.npy'
         
         if denoised_path.exists():
             C_all = np.load(denoised_path)
@@ -408,9 +405,8 @@ def _fig_correlation_matrices_split(datasets, labels, colors, corr_dir, per_data
             valid_idx = np.where(valid)[0]
             C = C_all[valid_idx]
         else:
-            conf = np.load(conf_path) if conf_path.exists() else np.ones(C_all.shape[0])
-            valid_idx = np.where(conf >= 0.5)[0]
-            C = C_all[valid_idx]
+            valid_idx = np.arange(C_all.shape[0])
+            C = C_all
         N = C.shape[0]
         
         if N < 3:
@@ -1232,9 +1228,9 @@ def fig_selected_traces(datasets: List[DatasetMetrics], output_dir: str) -> List
 
     for ds in datasets:
         result_path = Path(ds.filepath)
-        denoised_path = result_path / 'traces_denoised.npy'
-        spikes_path = result_path / 'spike_trains.npy'
-        raw_path = result_path / 'temporal_traces.npy'
+        denoised_path = result_path / 'data' / 'traces_denoised.npy'
+        spikes_path = result_path / 'data' / 'spike_trains.npy'
+        raw_path = result_path / 'data' / 'temporal_traces.npy'
 
         if not spikes_path.exists():
             logger.warning(f"  {ds.name}: no spike_trains.npy, skipping trace figure")
