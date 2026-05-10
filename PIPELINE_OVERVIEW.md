@@ -59,18 +59,22 @@ The pipeline computes per-neuron diagnostics including transient counts, signal-
 
 ### Stage 7 — Save Everything
 
-All results are saved as standard NumPy files:
+All results land in the recording's output directory, organised as
+`data/` (numerical), `figures/` (PNGs), and `diagnostics/` (pipeline
+JSON dumps and a small number of targeted figures).  Key files in
+`data/`:
 
 - `temporal_traces.npy` — ΔF/F₀ traces (neurons × time)
 - `traces_denoised.npy` — OASIS denoised traces
 - `spike_trains.npy` — inferred spike events
 - `spatial_footprints.npz` — where each neuron is located in the image
-- `confidence_scores.npy` — detection confidence per neuron
-- `max_projection_raw.npy` — unsmoothed max projection
+- `max_projection.npy` / `max_projection_raw.npy` — projections
 - `std_projection.npy` — std projection
 - `correlation_image.npy` — local correlation image
-- `diagnostics.npz` — per-neuron statistics
-- `run_info.json` — recording parameters and processing metadata
+- `motion_shifts.npy` — per-frame [dy, dx] shifts
+
+`run_info.json` (recording parameters and processing metadata) and any
+generated gallery HTMLs sit at the root of the output directory.
 
 An interactive HTML gallery can also be generated for manual inspection (if `--gallery` is enabled).
 

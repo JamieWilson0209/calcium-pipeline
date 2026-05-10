@@ -16,12 +16,12 @@
 #
 # USAGE:
 #   # Interactive (runs immediately on current node):
-#   bash calcium_pipeline/run.sh single --movie /path/to/file.nd2
-#   bash calcium_pipeline/run.sh analyse --results-dir /path/to/results
+#   bash calcium-pipeline/run.sh single --movie /path/to/file.nd2
+#   bash calcium-pipeline/run.sh analyse --results-dir /path/to/results
 #
 #   # Submit to SGE (queued on compute node):
-#   bash calcium_pipeline/run.sh batch --data-dir /path/to/data
-#   bash calcium_pipeline/run.sh full --data-dir /path/to/data
+#   bash calcium-pipeline/run.sh batch --data-dir /path/to/data
+#   bash calcium-pipeline/run.sh full --data-dir /path/to/data
 #
 # All parameters can be set as environment variables or --flags.
 # =============================================================================
@@ -48,7 +48,7 @@ mkdir -p "${MPLCONFIGDIR}" 2>/dev/null || true
 # Paths
 DATA_DIR="${DATA_DIR:-${SCRATCH_DIR}/data}"
 OUTPUT_BASE="${OUTPUT_BASE:-${SCRATCH_DIR}/results}"
-CONDA_ENV="${CONDA_ENV:-caiman}"
+CONDA_ENV="${CONDA_ENV:-calpipe}"
 
 # YAML configuration — single source of truth for all pipeline parameters.
 # Override per-run with --config /path/to/custom.yaml
@@ -100,19 +100,19 @@ COMMANDS:
 
 EXAMPLES:
   # Single file:
-  bash calcium_pipeline/run.sh single --movie /path/to/file.nd2
+  bash calcium-pipeline/run.sh single --movie /path/to/file.nd2
 
   # Batch all .nd2 files (submits SGE array):
-  bash calcium_pipeline/run.sh batch --data-dir /path/to/data
+  bash calcium-pipeline/run.sh batch --data-dir /path/to/data
 
   # Group analysis (submits SGE job):
-  bash calcium_pipeline/run.sh analyse --results-dir /path/to/results
+  bash calcium-pipeline/run.sh analyse --results-dir /path/to/results
 
   # Full pipeline (batch + analysis):
-  bash calcium_pipeline/run.sh full --data-dir /path/to/data
+  bash calcium-pipeline/run.sh full --data-dir /path/to/data
 
   # Custom YAML config:
-  bash calcium_pipeline/run.sh single --movie file.nd2 --config my_config.yaml
+  bash calcium-pipeline/run.sh single --movie file.nd2 --config my_config.yaml
 
 FLAGS:
   --movie PATH        Single .nd2 file (required for 'single')
@@ -127,7 +127,7 @@ per-run by copying the YAML and editing, or by passing individual CLI
 flags to the pipeline.
 
 ENVIRONMENT VARIABLES (shell-level only):
-  PIPELINE_DIR        Path to the calcium_pipeline/ directory
+  PIPELINE_DIR        Path to the calcium-pipeline/ directory
   SCRATCH_DIR         Scratch filesystem for results + temp files
   DATA_DIR            Input data directory
   OUTPUT_BASE         Output directory base
@@ -154,8 +154,7 @@ setup_conda() {
     if [ -f ~/miniconda3/etc/profile.d/conda.sh ]; then
         source ~/miniconda3/etc/profile.d/conda.sh 2>/dev/null || true
     fi
-    conda activate "${CONDA_ENV}" 2>/dev/null || \
-        conda activate caiman 2>/dev/null || true
+    conda activate "${CONDA_ENV}" 2>/dev/null || true
     set -e
 }
 
@@ -229,7 +228,7 @@ module load anaconda 2>/dev/null || true
     source ${CONDA_PREFIX:-/opt/conda}/etc/profile.d/conda.sh
 [ -f ~/miniconda3/etc/profile.d/conda.sh ] && \\
     source ~/miniconda3/etc/profile.d/conda.sh 2>/dev/null
-conda activate "\${CONDA_ENV}" 2>/dev/null || conda activate caiman 2>/dev/null || true
+conda activate "\${CONDA_ENV}" 2>/dev/null || true
 set -e
 
 echo "Python: \$(which python)"
@@ -365,7 +364,7 @@ module load anaconda 2>/dev/null || true
     source ${CONDA_PREFIX:-/opt/conda}/etc/profile.d/conda.sh
 [ -f ~/miniconda3/etc/profile.d/conda.sh ] && \
     source ~/miniconda3/etc/profile.d/conda.sh 2>/dev/null
-conda activate "${CONDA_ENV}" 2>/dev/null || conda activate caiman 2>/dev/null || true
+conda activate "${CONDA_ENV}" 2>/dev/null || true
 set -e
 
 echo "Python: $(which python)"
@@ -509,9 +508,8 @@ module load anaconda 2>/dev/null || true
     source ${CONDA_PREFIX:-/opt/conda}/etc/profile.d/conda.sh
 [ -f ~/miniconda3/etc/profile.d/conda.sh ] && \\
     source ~/miniconda3/etc/profile.d/conda.sh 2>/dev/null
-# Try activate by path first, then by name
+# Activate the calpipe env (created by setup/install.sh)
 conda activate "${CONDA_ENV}" 2>/dev/null || \\
-    conda activate caiman 2>/dev/null || \\
     echo "WARNING: conda activation failed — using system Python"
 set -e
 

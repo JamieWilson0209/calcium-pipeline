@@ -12,7 +12,7 @@ Currently functional and under active development.
 - **Auto-radius estimation** — sweeps candidate radii and selects the one
   producing the most high-SNR traces
 - **Motion correction** — CaImAn NoRMCorre rigid or piecewise-rigid
-  registration (optional; requires `caiman` package)
+  registration
 - **Flexible baseline correction** — per-trace rolling percentile
   (`global_dff`), tissue-masked local background (`local_background`) for
   organoids, or pass raw traces directly to OASIS (`direct`)
@@ -25,19 +25,27 @@ Currently functional and under active development.
 
 ## Installation
 
+The pipeline ships with `setup/environment.yml` and `setup/install.sh`.
+`install.sh` creates a fresh conda env named `calpipe` and installs every
+dependency (including CaImAn) from conda-forge.
+
 ```bash
 git clone https://github.com/JamieWilson0209/calcium-pipeline.git
-cd calcium_pipeline
+cd calcium-pipeline
 
-# Core dependencies
-pip install numpy scipy pyyaml tifffile scikit-image opencv-python matplotlib
-
-# Optional: motion correction (requires CaImAn)
-pip install caiman
-
-# Optional: Nikon ND2 file support
-pip install nd2
+bash setup/install.sh
+conda activate calpipe
 ```
+
+`bash setup/install.sh --force` rebuilds an existing env from scratch.
+The script uses `mamba` instead of `conda` if it's on PATH (much faster).
+
+> **Note:** never `pip install caiman` — there's an unrelated MicroPython
+> build tool with the same name on PyPI.  Always install CaImAn from
+> conda-forge.
+
+For HPC-specific setup (cluster modules, scratch quotas, SGE), see
+`docs/HPC_GUIDE.md`.
 
 ## Quick Start
 
@@ -112,22 +120,33 @@ bash run.sh single --movie recording.nd2 --frame-rate 30 --indicator gcamp6f
 
 ```
 output/
-├── spatial_footprints.npz       # Sparse spatial components (d1*d2 × N)
-├── temporal_traces.npy          # ΔF/F₀ traces (N × T)
-├── temporal_traces_raw.npy      # Raw fluorescence traces (N × T)
-├── traces_denoised.npy          # OASIS denoised traces (N × T)
-├── spike_trains.npy             # Inferred spike trains (N × T)
-├── confidence_scores.npy        # Per-neuron confidence (0–1)
-├── max_projection.npy           # Smoothed max projection
-├── max_projection_raw.npy       # Unsmoothed max projection
-├── std_projection.npy           # Unsmoothed std projection
-├── correlation_image.npy        # Local correlation image
-├── mean_projection.npy          # Smoothed mean projection
-├── motion_shifts.npy            # Per-frame [dy, dx] motion shifts
-├── diagnostics.npz              # Per-neuron statistics
 ├── run_info.json                # Config, timing, and result summary
-├── figures/                     # Projection images, contour overlays
-└── gallery.html                 # Interactive HTML report (if --gallery)
+├── gallery.html                 # Interactive HTML report (if --gallery)
+├── data/
+│   ├── spatial_footprints.npz   # Sparse spatial components (d1*d2 × N)
+│   ├── temporal_traces.npy      # ΔF/F₀ traces (N × T)
+│   ├── temporal_traces_raw.npy  # Raw fluorescence traces (N × T)
+│   ├── traces_denoised.npy      # OASIS denoised traces (N × T)
+│   ├── spike_trains.npy         # Inferred spike trains (N × T)
+│   ├── deconv_noise.npy         # Per-trace MAD noise estimate
+│   ├── motion_shifts.npy        # Per-frame [dy, dx] motion shifts
+│   ├── max_projection.npy       # Smoothed max projection
+│   ├── max_projection_raw.npy   # Unsmoothed max projection
+│   ├── std_projection.npy       # Unsmoothed std projection
+│   ├── mean_projection.npy      # Smoothed mean projection
+│   └── correlation_image.npy    # Local correlation image
+├── figures/                     # Diagnostic and inspection PNGs
+│   ├── motion_correction.png
+│   ├── auto_radius.png
+│   ├── deconvolution.png
+│   ├── decay_diagnostics.png
+│   ├── roi_traces/              # Top-N OASIS trace figures (one per ROI)
+│   └── inspection/              # Per-ROI inspection PNGs (if enabled)
+└── diagnostics/                 # Pipeline JSON dumps + targeted figures
+    ├── contour_detection_diagnostics.json
+    ├── per_blob_diagnostics.json
+    ├── hotspot_suppression.png
+    └── dff_local_background.png # Only with amplitude_method=local_background
 ```
 
 ## Supported File Formats
