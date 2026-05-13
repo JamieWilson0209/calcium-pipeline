@@ -29,6 +29,12 @@ The pipeline ships with `setup/environment.yml` and `setup/install.sh`.
 `install.sh` creates a fresh conda env named `calpipe` and installs every
 dependency (including CaImAn) from conda-forge.
 
+Load anconda first
+ 
+```bash
+module load anaconda
+```
+
 ```bash
 git clone https://github.com/JamieWilson0209/calcium-pipeline.git
 cd calcium-pipeline
