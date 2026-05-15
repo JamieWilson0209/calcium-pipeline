@@ -166,6 +166,11 @@ output/
 
 ## Supported Calcium Indicators
 
+Note - OASIS auto-estimates decay co-efficient by default, which is more robust to variable transient duration. 
+Disable by changing optimize_g to False in config:
+  - This forces OASIS to fit the designated decay time:
+  - Useful for examining transients of specific duration, less robust for overall quantification of activity 
+
 Decay times are auto-resolved from the indicator name (full table in
 `src/config_loader.py`):
 
